@@ -181,6 +181,10 @@ pm() { "$PM_BIN" "$@"; }
 # stop + cleanup. Best-effort stops any pre-existing session for $HOST first.
 pm_start_session() { # spec...
     pm stop "$HOST" >/dev/null 2>&1 || true
+    # Isolate scenarios from each other: drop any remembered forward set so a
+    # plain launch starts from exactly the seed spec(s), not leftovers from a
+    # previous run (a plain `portmanager <host>` resumes persisted state).
+    pm forget "$HOST" >/dev/null 2>&1 || true
     info "starting session: $HOST $* $PM_LAUNCH_ARGS_RAW"
     # The ${arr[@]+"${arr[@]}"} idiom expands to nothing when the array is empty,
     # avoiding the "unbound variable" error set -u raises in bash 3.2 (macOS).
