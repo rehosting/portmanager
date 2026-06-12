@@ -137,9 +137,28 @@ local = "same"       # mirror remote port; fall back to a free one
 
 ## Build
 
+`scripts/pm.sh` is the single entrypoint that handles the multi-target build
+(host client + bundled Linux agents) and packaging:
+
+```console
+$ scripts/pm.sh build              # client (release) + musl agents -> package dir
+$ scripts/pm.sh run myhost 8888    # run the packaged client (builds if missing)
+$ scripts/pm.sh test               # cargo test (args forwarded)
+$ scripts/pm.sh check              # fmt --check + clippy -D warnings + test (CI parity)
+$ scripts/pm.sh package            # tar.gz the package for distribution
+```
+
+`build` assembles `dist/portmanager-<host-triple>/` — the client plus
+`agents/agent-<triple>` beside it — which is the layout the client deploys
+from, and also installs the agents into `~/.cache/portmanager/dist/`. Agent
+cross-compilation uses `cargo-zigbuild`, `cross`, or a local `*-linux-musl-gcc`,
+whichever is available (missing toolchains are skipped with a warning).
+
+Plain cargo still works for a quick same-arch build:
+
 ```console
 $ cargo build --release            # client (and same-arch agent)
-$ scripts/build-agents.sh          # static musl agents (x86_64 + aarch64)
+$ scripts/build-agents.sh          # just the static musl agents, into the dist cache
 ```
 
 Release packages include the client for one platform plus Linux agents under
