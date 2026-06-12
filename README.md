@@ -167,6 +167,33 @@ client looks for `agents/agent-<triple>` next to itself, then
 `~/.cache/portmanager/dist/agent-<triple>`. `PORTMANAGER_AGENT_BIN` overrides
 both for manual testing.
 
+### Docker
+
+A slim image (Alpine + `openssh-client` + a static-musl client with both Linux
+agents bundled) runs the client from a container:
+
+```console
+$ scripts/pm.sh docker-build                 # -> portmanager:local
+$ scripts/pm.sh docker-run myhost 8888 db.internal:5432
+```
+
+`docker-run` uses host networking (so forwarded ports land on the host's
+loopback) and mounts your `~/.ssh` read-only, running as your own UID with
+`/etc/passwd` mounted so SSH key ownership/permission checks pass; it forwards
+`$SSH_AUTH_SOCK` when present. Equivalent raw command:
+
+```console
+$ docker run --rm -it --network host \
+    --user "$(id -u):$(id -g)" -v /etc/passwd:/etc/passwd:ro \
+    -v "$HOME/.ssh:$HOME/.ssh:ro" -e HOME="$HOME" \
+    portmanager:local myhost 8888
+```
+
+Notes: `--network host` is Linux-only (Docker Desktop on macOS/Windows handles
+it differently), and the control socket lives inside the container — use the
+foreground form, or `docker exec` into the same container for `add`/`list`.
+Multi-arch: `docker buildx build --platform linux/amd64,linux/arm64 .`.
+
 ## Test
 
 ```console

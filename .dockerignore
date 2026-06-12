@@ -1,0 +1,7 @@
+# Keep the build context small/fast — the builder compiles from source.
+/target
+/dist
+/packages
+.git
+.github
+*.md
