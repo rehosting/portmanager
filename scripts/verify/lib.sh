@@ -14,7 +14,10 @@ set -euo pipefail
 
 HOST="${HOST:-${PM_HOST:-localhost}}"
 # Extra args passed to the portmanager session launch (e.g. -v, --remote-udp).
-PM_LAUNCH_ARGS=(${PM_LAUNCH_ARGS:-})
+# Keep the raw string for display; split into an array for passing.
+PM_LAUNCH_ARGS_RAW="${PM_LAUNCH_ARGS:-}"
+# shellcheck disable=SC2206  # intentional word-splitting of the arg string
+PM_LAUNCH_ARGS=($PM_LAUNCH_ARGS_RAW)
 
 # ---------------------------------------------------------------------------
 # Locate the portmanager client. Prefer the built package (bundled agents),
@@ -178,8 +181,10 @@ pm() { "$PM_BIN" "$@"; }
 # stop + cleanup. Best-effort stops any pre-existing session for $HOST first.
 pm_start_session() { # spec...
     pm stop "$HOST" >/dev/null 2>&1 || true
-    info "starting session: $HOST $* ${PM_LAUNCH_ARGS[*]:-}"
-    if ! pm --daemon "${PM_LAUNCH_ARGS[@]}" "$HOST" "$@"; then
+    info "starting session: $HOST $* $PM_LAUNCH_ARGS_RAW"
+    # The ${arr[@]+"${arr[@]}"} idiom expands to nothing when the array is empty,
+    # avoiding the "unbound variable" error set -u raises in bash 3.2 (macOS).
+    if ! pm --daemon ${PM_LAUNCH_ARGS[@]+"${PM_LAUNCH_ARGS[@]}"} "$HOST" "$@"; then
         echo "error: failed to start session; recent client log:" >&2
         local log="${XDG_CACHE_HOME:-$HOME/.cache}/portmanager/client.log"
         [[ -f "$log" ]] && tail -n 20 "$log" >&2
