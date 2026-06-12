@@ -86,7 +86,9 @@ async fn agent_binary_bootstraps_and_forwards() {
         local_port: 0,
         local_port_auto: false,
     };
-    let (local_addr, _task) = client::bind_forward(slot_rx, forward).await.unwrap();
+    let (local_addr, _task) = client::bind_forward(slot_rx, forward, client::new_health_handle())
+        .await
+        .unwrap();
 
     let payload = b"the quick brown fox jumps over the lazy dog".repeat(2000);
     let mut sock = TcpStream::connect(local_addr).await.unwrap();

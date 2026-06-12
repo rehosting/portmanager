@@ -63,6 +63,14 @@ pub enum Command {
         host: String,
         /// Forward specs (or local ports) to remove.
         specs: Vec<String>,
+        /// Remove every forward (ignores SPECS); same as `clear`.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Remove every forward from the running session for HOST.
+    Clear {
+        /// Target host whose session to clear.
+        host: String,
     },
     /// List active forwards for HOST's running session.
     List {
@@ -77,6 +85,25 @@ pub enum Command {
     /// Stop HOST's running background or foreground session.
     Stop {
         /// Target host whose session to stop.
+        host: String,
+    },
+    /// Forget HOST's persisted state (remembered forwards, assignments, rules).
+    /// Does not touch a running session; affects the next plain launch.
+    Forget {
+        /// Target host whose saved state to delete.
+        host: String,
+    },
+    /// Tail the remote agent's log over SSH (for debugging).
+    Logs {
+        /// Target host whose agent log to read.
+        host: String,
+        /// Follow the log (`tail -f`) instead of printing the tail and exiting.
+        #[arg(short, long)]
+        follow: bool,
+    },
+    /// Diagnose connectivity and setup for HOST (SSH, arch, agent binary, session).
+    Doctor {
+        /// Target host to diagnose.
         host: String,
     },
     /// Remote agent role. Launched automatically over SSH; not for manual use.

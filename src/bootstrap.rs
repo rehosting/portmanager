@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use tokio::io::BufReader;
 use tokio::process::Command;
+use tracing::{debug, info};
 
 use crate::crypto::{Fingerprint, Identity, Timing};
 use crate::handshake::{Hello, Ready, SessionId, Token};
@@ -36,6 +37,8 @@ pub struct AgentSession {
     pub session_id: SessionId,
     /// Shared re-attach secret.
     pub token: Token,
+    /// Agent binary version reported in the handshake (skew detection).
+    pub agent_version: String,
 }
 
 /// Map `uname -s -m` output to the agent's cross-compile target triple.
@@ -70,7 +73,7 @@ fn local_arch_token() -> &'static str {
 ///    `scripts/build-agents.sh`),
 /// 5. this workspace's own `target/<triple>/release/portmanager` (dev builds),
 /// 6. our own binary, if the remote arch matches the local one.
-fn agent_binary_for(triple: &str, remote_arch: &str) -> Result<std::path::PathBuf> {
+pub(crate) fn agent_binary_for(triple: &str, remote_arch: &str) -> Result<std::path::PathBuf> {
     if let Ok(p) = std::env::var("PORTMANAGER_AGENT_BIN") {
         let p = std::path::PathBuf::from(p);
         if p.is_file() {
@@ -123,7 +126,10 @@ fn agent_binary_for(triple: &str, remote_arch: &str) -> Result<std::path::PathBu
 }
 
 /// Bootstrap an agent on `host` listening on `listen` (a UDP bind spec).
-pub async fn bootstrap(host: &str, listen: &str) -> Result<AgentSession> {
+///
+/// `verbose` is the client's `-v` count, threaded to the agent so remote logs
+/// match the requested verbosity.
+pub async fn bootstrap(host: &str, listen: &str, verbose: u8) -> Result<AgentSession> {
     let hostname = ssh_hostname(host).await?;
 
     let uname = ssh_capture(host, &["uname", "-sm"])
@@ -135,19 +141,27 @@ pub async fn bootstrap(host: &str, listen: &str) -> Result<AgentSession> {
     let exe = agent_binary_for(triple, remote_arch)?;
     let remote_path = deploy_agent(host, &exe, triple).await?;
 
+    // Autoupdate: evict any lingering agent running a different version than
+    // the binary we just deployed, so the remote ends up on current code.
+    reap_stale_agents(host, env!("CARGO_PKG_VERSION")).await;
+
     let client_id = Identity::generate()?;
     let token = Token::random()?;
 
     // Launch the agent over SSH with piped stdio for the handshake. The agent
     // daemonizes after replying READY, so this ssh process exits on its own.
-    let mut child = Command::new("ssh")
-        .arg("-o")
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o")
         .arg(SSH_CONNECT_TIMEOUT)
         .arg(host)
         .arg(&remote_path)
         .arg("agent")
         .arg("--listen")
-        .arg(listen)
+        .arg(listen);
+    for _ in 0..verbose {
+        cmd.arg("-v");
+    }
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -181,7 +195,69 @@ pub async fn bootstrap(host: &str, listen: &str) -> Result<AgentSession> {
         client_id,
         session_id: ready.session_id,
         token,
+        agent_version: ready.version,
     })
+}
+
+/// Terminate any daemonized agent recorded on `host` whose version differs from
+/// `version` (the binary we are about to launch). Best-effort: a failure here
+/// just means a stale agent lingers until its grace window, so errors are
+/// logged at debug and swallowed. The script also prunes state files for dead
+/// pids. The reap script is fed over stdin to avoid remote-shell quoting.
+async fn reap_stale_agents(host: &str, version: &str) {
+    const SCRIPT: &str = r#"
+ver="$1"
+dir="$HOME/.cache/portmanager/agents"
+[ -d "$dir" ] || exit 0
+for f in "$dir"/*.json; do
+  [ -e "$f" ] || continue
+  v=$(sed -n 's/.*"version":"\([^"]*\)".*/\1/p' "$f")
+  p=$(sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' "$f")
+  [ -n "$p" ] || { rm -f "$f"; continue; }
+  if ! kill -0 "$p" 2>/dev/null; then rm -f "$f"; continue; fi
+  if [ "$v" != "$ver" ]; then
+    kill -TERM "$p" 2>/dev/null && echo "reaped stale agent pid=$p version=$v"
+    rm -f "$f"
+  fi
+done
+"#;
+
+    let child = Command::new("ssh")
+        .arg("-o")
+        .arg(SSH_CONNECT_TIMEOUT)
+        .arg(host)
+        .arg("sh")
+        .arg("-s")
+        .arg("--")
+        .arg(version)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(error = %e, "could not launch stale-agent reaper");
+            return;
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let _ = stdin.write_all(SCRIPT.as_bytes()).await;
+        let _ = stdin.shutdown().await;
+        drop(stdin);
+    }
+    match child.wait_with_output().await {
+        Ok(out) => {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let line = line.trim();
+                if !line.is_empty() {
+                    info!(host, "{line}");
+                }
+            }
+        }
+        Err(e) => debug!(error = %e, "stale-agent reaper failed"),
+    }
 }
 
 /// Resolve the real hostname for an SSH alias via `ssh -G`.
@@ -196,7 +272,7 @@ async fn ssh_hostname(host: &str) -> Result<String> {
     Ok(host.to_string())
 }
 
-async fn ssh_g(host: &str) -> Result<String> {
+pub(crate) async fn ssh_g(host: &str) -> Result<String> {
     let output = Command::new("ssh")
         .arg("-G")
         .arg(host)
@@ -210,7 +286,7 @@ async fn ssh_g(host: &str) -> Result<String> {
 }
 
 /// Run a command on the remote over SSH and capture stdout.
-async fn ssh_capture(host: &str, args: &[&str]) -> Result<String> {
+pub(crate) async fn ssh_capture(host: &str, args: &[&str]) -> Result<String> {
     let output = Command::new("ssh")
         .arg("-o")
         .arg(SSH_CONNECT_TIMEOUT)
@@ -250,6 +326,7 @@ async fn deploy_agent(host: &str, exe: &Path, triple: &str) -> Result<String> {
         .success();
 
     if exists {
+        gc_stale_agents(host, triple, &short).await;
         return Ok(remote_path);
     }
 
@@ -286,7 +363,27 @@ async fn deploy_agent(host: &str, exe: &Path, triple: &str) -> Result<String> {
         bail!("failed to install agent binary on remote");
     }
 
+    gc_stale_agents(host, triple, &short).await;
     Ok(remote_path)
+}
+
+/// Best-effort removal of cached agent binaries for `triple` other than the
+/// current one (`agent-<triple>-<keep>`). Unlinking a running ELF is safe on
+/// Linux, so this never disturbs a live agent. Errors are ignored.
+async fn gc_stale_agents(host: &str, triple: &str, keep: &str) {
+    let find = format!(
+        "find .cache/portmanager -maxdepth 1 -type f -name 'agent-{triple}-*' \
+         ! -name 'agent-{triple}-{keep}' -delete 2>/dev/null || true"
+    );
+    let _ = Command::new("ssh")
+        .arg("-o")
+        .arg(SSH_CONNECT_TIMEOUT)
+        .arg(host)
+        .arg(find)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
 }
 
 /// Default QUIC timing for bootstrapped sessions.

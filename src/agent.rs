@@ -57,6 +57,7 @@ pub fn run(listen: &str, grace: Duration, foreground: bool) -> Result<()> {
         udp_port: local.port(),
         agent_fp: identity.fingerprint,
         session_id,
+        version: env!("CARGO_PKG_VERSION").to_string(),
     };
     {
         let mut stdout = std::io::stdout().lock();
@@ -71,13 +72,21 @@ pub fn run(listen: &str, grace: Duration, foreground: bool) -> Result<()> {
         daemonize()?;
     }
 
+    // Record this agent (pid/port/version) so a future client can detect a
+    // stale version and evict it — see bootstrap::reap_stale_agents.
+    let state_path = if foreground {
+        None
+    } else {
+        write_agent_state(local.port())
+    };
+
     // 4. Now start the runtime and serve.
     let server_cfg = crypto::server_config(&identity, hello.client_fp, &crypto::Timing::default())?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("building tokio runtime")?;
-    runtime.block_on(async move {
+    let result = runtime.block_on(async move {
         socket
             .set_nonblocking(true)
             .context("setting UDP socket non-blocking")?;
@@ -89,7 +98,34 @@ pub fn run(listen: &str, grace: Duration, foreground: bool) -> Result<()> {
         )
         .context("building QUIC endpoint")?;
         serve_with_grace(endpoint, grace).await
-    })
+    });
+
+    // Clean up the state file on a graceful exit (best-effort).
+    if let Some(path) = state_path {
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
+/// Directory holding per-agent state files (`<udp_port>.json`).
+pub fn agent_state_dir() -> Option<std::path::PathBuf> {
+    directories::BaseDirs::new().map(|d| d.cache_dir().join("portmanager/agents"))
+}
+
+/// Persist this agent's identity for a future client's staleness check.
+/// Best-effort: returns the written path, or `None` if it could not be written.
+fn write_agent_state(udp_port: u16) -> Option<std::path::PathBuf> {
+    let dir = agent_state_dir()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{udp_port}.json"));
+    let body = format!(
+        r#"{{"pid":{},"udp_port":{},"version":"{}"}}"#,
+        std::process::id(),
+        udp_port,
+        env!("CARGO_PKG_VERSION"),
+    );
+    std::fs::write(&path, body).ok()?;
+    Some(path)
 }
 
 /// Read the HELLO line from real (blocking) stdin.

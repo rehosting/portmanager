@@ -72,12 +72,39 @@ Rootful `netns:<name>` is parsed but not yet supported.
 ### Live control & memory
 
 ```console
-$ portmanager add  myhost 9000->9000   # bind on the running session, no restart
-$ portmanager drop myhost 8888
-$ portmanager list myhost
-$ portmanager status myhost
-$ portmanager stop myhost
+$ portmanager add   myhost 9000->9000   # bind on the running session, no restart
+$ portmanager drop  myhost 8888         # by spec or local port
+$ portmanager drop  myhost --all        # drop everything (alias: `clear`)
+$ portmanager clear myhost
+$ portmanager list  myhost              # shows per-forward health (ok / last error)
+$ portmanager status myhost             # session state + agent/client versions
+$ portmanager stop  myhost
+$ portmanager forget myhost             # delete the saved state for this host
 ```
+
+`add`/`list`/`status` report **live health**, not just whether the listener
+bound: `add` tells you if the session is mid-reconnect, and `list`/`status` show
+the most recent connection error per forward (e.g. the agent couldn't reach the
+target) instead of a forward silently doing nothing.
+
+### Debugging
+
+```console
+$ portmanager logs   myhost        # tail the remote agent log over SSH
+$ portmanager logs   myhost -f     # follow it
+$ portmanager doctor myhost        # checklist: SSH, arch, agent binary, session, log
+$ portmanager -vv myhost 8888      # -v/-vv is threaded through to the remote agent
+```
+
+### Agent autoupdate
+
+The agent binary is content-addressed on the remote (`agent-<triple>-<hash>`), so
+a fresh launch always deploys the current client's agent. On bootstrap the client
+also **evicts any lingering agent running a different version** (recorded in
+`~/.cache/portmanager/agents/<port>.json`) and **garbage-collects stale cached
+binaries**, so the remote converges on current code after a client upgrade.
+`status`/`doctor` surface the running agent's version next to the client's so
+skew is visible.
 
 Changes persist: a plain `portmanager myhost` resumes the set you ended with
 (per-host state), and `--profile NAME` uses/updates a named profile in
@@ -124,7 +151,7 @@ both for manual testing.
 ## Test
 
 ```console
-$ cargo test                       # 42 tests: unit + loopback QUIC + real agent process
+$ cargo test                       # unit + loopback QUIC + real agent process
 $ podman run --rm -d --name pmtest alpine sleep 60
 $ podman exec -d pmtest nc -l -p 7777 -s 127.0.0.1
 $ cargo test --test netns_helper -- --ignored   # real namespace-entry proof

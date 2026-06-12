@@ -200,6 +200,17 @@ pub fn save_state(host: &str, state: &HostState) -> Result<()> {
     Ok(())
 }
 
+/// Delete the persisted state file for `host`. Returns `true` if a file was
+/// removed, `false` if there was nothing to forget.
+pub fn forget_state(host: &str) -> Result<bool> {
+    let path = state_path(host)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
 /// Make a host string filesystem-safe.
 fn sanitize(host: &str) -> String {
     host.chars()

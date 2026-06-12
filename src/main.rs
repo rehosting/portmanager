@@ -17,7 +17,7 @@ use portmanager::client::ForwardSet;
 use portmanager::control::{self, Request, Response};
 use portmanager::forward::ForwardSpec;
 use portmanager::supervisor::{Status, Supervisor};
-use portmanager::{agent, config, crypto, discovery, netns};
+use portmanager::{agent, config, crypto, discovery, doctor, netns};
 
 const DAEMON_CHILD_ENV: &str = "PORTMANAGER_DAEMON_CHILD";
 
@@ -39,7 +39,7 @@ fn main() -> Result<()> {
                 spawn_daemon(&cli.run, cli.verbose)?;
                 Ok(())
             } else {
-                block_on(run_client(cli.run))
+                block_on(run_client(cli.run, cli.verbose))
             }
         }
     }
@@ -53,8 +53,17 @@ fn block_on<F: std::future::Future<Output = Result<()>>>(fut: F) -> Result<()> {
         .block_on(fut)
 }
 
-/// `add`/`drop`/`list`/`status`: talk to the running session's control socket.
+/// `add`/`drop`/`clear`/`list`/`status`/`stop`: talk to the running session's
+/// control socket. `forget`/`logs`/`doctor` don't use the socket and are routed
+/// here first.
 async fn run_control_command(cmd: Command) -> Result<()> {
+    match cmd {
+        Command::Forget { host } => return run_forget(&host).await,
+        Command::Logs { host, follow } => return run_logs(&host, follow).await,
+        Command::Doctor { host } => return doctor::run(&host).await,
+        _ => {}
+    }
+
     let (host, requests) = match cmd {
         Command::Add { host, specs } => {
             if specs.is_empty() {
@@ -73,21 +82,29 @@ async fn run_control_command(cmd: Command) -> Result<()> {
                     .collect::<Vec<_>>(),
             )
         }
-        Command::Drop { host, specs } => {
-            if specs.is_empty() {
-                bail!("drop: pass at least one forward spec or local port");
+        Command::Drop { host, specs, all } => {
+            if all {
+                (host, vec![Request::Clear])
+            } else {
+                if specs.is_empty() {
+                    bail!("drop: pass at least one forward spec or local port (or --all)");
+                }
+                (
+                    host,
+                    specs
+                        .into_iter()
+                        .map(|spec| Request::Drop { spec })
+                        .collect(),
+                )
             }
-            (
-                host,
-                specs
-                    .into_iter()
-                    .map(|spec| Request::Drop { spec })
-                    .collect(),
-            )
         }
+        Command::Clear { host } => (host, vec![Request::Clear]),
         Command::List { host } => (host, vec![Request::List]),
         Command::Status { host } => (host, vec![Request::Status]),
         Command::Stop { host } => (host, vec![Request::Stop]),
+        Command::Forget { .. } | Command::Logs { .. } | Command::Doctor { .. } => {
+            unreachable!("handled above")
+        }
         Command::Agent(_) | Command::NsHelper => unreachable!("handled in main"),
     };
 
@@ -96,8 +113,15 @@ async fn run_control_command(cmd: Command) -> Result<()> {
         match control::request(&host, req).await? {
             Response::Ok { message } => println!("{message}"),
             Response::Forwards { entries } => print_entries(&entries),
-            Response::StatusIs { state, entries } => {
-                println!("session: {state}");
+            Response::StatusIs {
+                state,
+                agent_version,
+                entries,
+            } => {
+                println!(
+                    "session: {state} (agent v{agent_version}, client v{})",
+                    env!("CARGO_PKG_VERSION")
+                );
                 print_entries(&entries);
             }
             Response::Error { message } => {
@@ -118,13 +142,59 @@ fn print_entries(entries: &[control::ForwardEntry]) {
         return;
     }
     for e in entries {
-        println!("{:<24} {}", e.local, e.spec);
+        if e.health.is_empty() {
+            println!("{:<24} {}", e.local, e.spec);
+        } else {
+            println!("{:<24} {:<32} {}", e.local, e.spec, e.health);
+        }
     }
+}
+
+/// `forget`: delete a host's persisted state. Best-effort note if a live
+/// session is still running (its in-memory set is unaffected until it next
+/// persists, which would rewrite the file).
+async fn run_forget(host: &str) -> Result<()> {
+    let session_live = control::request(host, &Request::Status).await.is_ok();
+    let forgot = tokio::task::spawn_blocking({
+        let host = host.to_string();
+        move || config::forget_state(&host)
+    })
+    .await??;
+    if forgot {
+        println!("forgot saved state for {host:?}");
+    } else {
+        println!("no saved state for {host:?}");
+    }
+    if session_live {
+        println!(
+            "note: a session for {host:?} is still running; its current forwards \
+             will be re-saved if it persists again (stop it first to keep state cleared)"
+        );
+    }
+    Ok(())
+}
+
+/// `logs`: tail the remote agent log over SSH. With `follow`, streams until the
+/// user interrupts.
+async fn run_logs(host: &str, follow: bool) -> Result<()> {
+    let mut cmd = tokio::process::Command::new("ssh");
+    cmd.arg("-o").arg("ConnectTimeout=10").arg(host).arg("tail");
+    if follow {
+        cmd.arg("-f");
+    }
+    cmd.arg("-n").arg("200").arg(".cache/portmanager/agent.log");
+    let status = cmd.status().await.context("running ssh tail")?;
+    if !status.success() {
+        bail!(
+            "could not read remote agent log (it may not exist yet — has the agent run on {host:?}?)"
+        );
+    }
+    Ok(())
 }
 
 /// Default action: bootstrap an agent on the host and serve the forward set
 /// under the never-give-up supervisor, with control socket + discovery.
-async fn run_client(args: cli::RunArgs) -> Result<()> {
+async fn run_client(args: cli::RunArgs, verbose: u8) -> Result<()> {
     // Resolve host, initial forwards, rules, and the persistence target from
     // either a named profile or the per-host remembered state.
     let (host, mut forwards, rules, persist) = if let Some(name) = &args.profile {
@@ -186,7 +256,7 @@ async fn run_client(args: cli::RunArgs) -> Result<()> {
         );
     }
 
-    let supervisor = Supervisor::start(host.clone(), args.remote_udp.clone())
+    let supervisor = Supervisor::start(host.clone(), args.remote_udp.clone(), verbose)
         .await
         .map_err(|e| {
             e.context(
@@ -207,6 +277,7 @@ async fn run_client(args: cli::RunArgs) -> Result<()> {
         host: host.clone(),
         forwards: forward_set.clone(),
         status: supervisor.status.clone(),
+        agent_version: supervisor.agent_version.clone(),
         shutdown: Some(shutdown_tx),
         persist,
     }));

@@ -62,10 +62,12 @@ async fn control_socket_add_drop_list_status() {
     let forwards = Arc::new(ForwardSet::new(slot_rx));
     let (_status_tx, status_rx) = watch::channel(Status::Connected);
 
+    let (_av_tx, av_rx) = watch::channel("test-agent".to_string());
     let ctx = ControlCtx {
         host: host.clone(),
         forwards: forwards.clone(),
         status: status_rx,
+        agent_version: av_rx,
         shutdown: None,
         persist: portmanager::config::PersistTarget::HostState { host: host.clone() },
     };
@@ -105,8 +107,13 @@ async fn control_socket_add_drop_list_status() {
     // status reports connected + the forward
     let resp = control::request(&host, &Request::Status).await.unwrap();
     match resp {
-        Response::StatusIs { state, entries } => {
+        Response::StatusIs {
+            state,
+            agent_version,
+            entries,
+        } => {
             assert_eq!(state, "connected");
+            assert_eq!(agent_version, "test-agent");
             assert_eq!(entries.len(), 1);
         }
         other => panic!("unexpected status response: {other:?}"),
@@ -173,9 +180,9 @@ async fn discovery_autoforwards_new_listener() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let bound = loop {
         let list = forwards.list().await;
-        if let Some((spec, local)) = list.first() {
-            assert_eq!(spec.remote_port, echo.port());
-            break *local;
+        if let Some(s) = list.first() {
+            assert_eq!(s.spec.remote_port, echo.port());
+            break s.local;
         }
         if tokio::time::Instant::now() > deadline {
             panic!("discovery never auto-forwarded the listener");

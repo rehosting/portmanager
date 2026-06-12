@@ -66,7 +66,9 @@ async fn forwards_bytes_end_to_end() {
         local_port: 0,
         local_port_auto: false,
     };
-    let (local_addr, _task) = client::bind_forward(slot_rx, forward).await.unwrap();
+    let (local_addr, _task) = client::bind_forward(slot_rx, forward, client::new_health_handle())
+        .await
+        .unwrap();
 
     // Drive a large payload through the local port and assert byte-exact echo.
     let payload: Vec<u8> = (0..1_500_000u32).map(|i| (i % 251) as u8).collect();
@@ -124,7 +126,9 @@ async fn listener_survives_reconnect() {
         local_port: 0,
         local_port_auto: false,
     };
-    let (local_addr, _task) = client::bind_forward(slot_rx, forward).await.unwrap();
+    let (local_addr, _task) = client::bind_forward(slot_rx, forward, client::new_health_handle())
+        .await
+        .unwrap();
 
     // Round-trip once on the first connection.
     let mut s1 = TcpStream::connect(local_addr).await.unwrap();

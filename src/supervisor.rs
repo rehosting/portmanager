@@ -54,6 +54,8 @@ pub struct Supervisor {
     pub slot: ConnSlot,
     /// Status feed for display.
     pub status: watch::Receiver<Status>,
+    /// Current agent binary version (updates across re-bootstraps).
+    pub agent_version: watch::Receiver<String>,
     shutdown_tx: watch::Sender<bool>,
     monitor: tokio::task::JoinHandle<()>,
 }
@@ -61,13 +63,16 @@ pub struct Supervisor {
 impl Supervisor {
     /// Bootstrap `host` and start supervising. Returns once the first
     /// connection is up (so callers can bind forwards immediately).
-    pub async fn start(host: String, listen: Option<String>) -> Result<Self> {
+    ///
+    /// `verbose` is the client's `-v` count, threaded to the remote agent.
+    pub async fn start(host: String, listen: Option<String>, verbose: u8) -> Result<Self> {
         let timing = Timing::default();
 
         let (status_tx, status_rx) = watch::channel(Status::Bootstrapping);
         info!(%host, "bootstrapping agent over SSH");
-        let session = bootstrap_agent(&host, listen.as_deref()).await?;
+        let session = bootstrap_agent(&host, listen.as_deref(), verbose).await?;
         let addr = resolve(&session.quic_target).await?;
+        let (version_tx, version_rx) = watch::channel(session.agent_version.clone());
 
         // One endpoint for the whole session lifetime; per-connect configs
         // (the pinned agent fp changes across re-bootstraps).
@@ -96,6 +101,7 @@ impl Supervisor {
         let monitor = tokio::spawn(monitor_loop(MonitorCtx {
             host,
             listen,
+            verbose,
             endpoint,
             timing,
             session,
@@ -105,12 +111,14 @@ impl Supervisor {
             slot_tx,
             target_tx,
             status_tx,
+            version_tx,
             shutdown_rx,
         }));
 
         Ok(Supervisor {
             slot: slot_rx,
             status: status_rx,
+            agent_version: version_rx,
             shutdown_tx,
             monitor,
         })
@@ -128,6 +136,7 @@ impl Supervisor {
 struct MonitorCtx {
     host: String,
     listen: Option<String>,
+    verbose: u8,
     endpoint: Endpoint,
     timing: Timing,
     session: AgentSession,
@@ -137,6 +146,7 @@ struct MonitorCtx {
     slot_tx: watch::Sender<Option<Connection>>,
     target_tx: watch::Sender<SocketAddr>,
     status_tx: watch::Sender<Status>,
+    version_tx: watch::Sender<String>,
     shutdown_rx: watch::Receiver<bool>,
 }
 
@@ -211,7 +221,7 @@ async fn monitor_loop(mut ctx: MonitorCtx) {
             if attempt.is_multiple_of(REATTACH_ATTEMPTS_PER_CYCLE) {
                 ctx.status_tx.send_replace(Status::Bootstrapping);
                 info!("re-bootstrapping agent over SSH");
-                match bootstrap_agent(&ctx.host, ctx.listen.as_deref()).await {
+                match bootstrap_agent(&ctx.host, ctx.listen.as_deref(), ctx.verbose).await {
                     Ok(session) => match resolve(&session.quic_target).await {
                         Ok(addr) => {
                             match crypto::client_config(
@@ -220,6 +230,7 @@ async fn monitor_loop(mut ctx: MonitorCtx) {
                                 &ctx.timing,
                             ) {
                                 Ok(cfg) => {
+                                    ctx.version_tx.send_replace(session.agent_version.clone());
                                     ctx.session = session;
                                     ctx.client_cfg = cfg;
                                     ctx.addr = addr;
@@ -259,15 +270,15 @@ async fn monitor_loop(mut ctx: MonitorCtx) {
     }
 }
 
-async fn bootstrap_agent(host: &str, listen: Option<&str>) -> Result<AgentSession> {
+async fn bootstrap_agent(host: &str, listen: Option<&str>, verbose: u8) -> Result<AgentSession> {
     if let Some(listen) = listen {
-        return bootstrap::bootstrap(host, listen).await;
+        return bootstrap::bootstrap(host, listen, verbose).await;
     }
 
     let mut last_err = None;
     for port in DEFAULT_UDP_PORT_START..=DEFAULT_UDP_PORT_END {
         let listen = format!("0.0.0.0:{port}");
-        match bootstrap::bootstrap(host, &listen).await {
+        match bootstrap::bootstrap(host, &listen, verbose).await {
             Ok(session) => return Ok(session),
             Err(e) => last_err = Some(e),
         }

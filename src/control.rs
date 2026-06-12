@@ -25,8 +25,14 @@ use crate::supervisor::Status;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
-    Add { spec: String },
-    Drop { spec: String },
+    Add {
+        spec: String,
+    },
+    Drop {
+        spec: String,
+    },
+    /// Remove every forward at once.
+    Clear,
     List,
     Status,
     Stop,
@@ -42,6 +48,7 @@ pub enum Response {
     },
     StatusIs {
         state: String,
+        agent_version: String,
         entries: Vec<ForwardEntry>,
     },
     Error {
@@ -53,6 +60,10 @@ pub enum Response {
 pub struct ForwardEntry {
     pub spec: String,
     pub local: String,
+    /// Human-readable live health (e.g. `ok (3 conns)`, `last error: ...`,
+    /// `session reconnecting`).
+    #[serde(default)]
+    pub health: String,
 }
 
 /// Control socket path for `host`.
@@ -104,6 +115,8 @@ pub struct ControlCtx {
     pub host: String,
     pub forwards: Arc<ForwardSet>,
     pub status: watch::Receiver<Status>,
+    /// Current agent binary version (for skew display in `status`).
+    pub agent_version: watch::Receiver<String>,
     /// Optional shutdown signal for the owning session.
     pub shutdown: Option<mpsc::UnboundedSender<()>>,
     /// Where live changes are written back (host state or named profile).
@@ -183,12 +196,19 @@ async fn handle(stream: UnixStream, ctx: &ControlCtx) -> Result<()> {
 async fn dispatch(req: Request, ctx: &ControlCtx) -> (Response, bool) {
     match req {
         Request::Add { spec } => match add_forward(&spec, ctx).await {
-            Ok(local) => (
-                Response::Ok {
-                    message: format!("forward up on {local}"),
-                },
-                false,
-            ),
+            Ok(local) => {
+                let message = match &*ctx.status.borrow() {
+                    Status::Connected => format!("forward up on {local}"),
+                    Status::Reconnecting { attempt } => format!(
+                        "forward bound on {local} (session reconnecting, attempt {attempt} — \
+                         will carry once restored)"
+                    ),
+                    Status::Bootstrapping => format!(
+                        "forward bound on {local} (session bootstrapping — will carry once connected)"
+                    ),
+                };
+                (Response::Ok { message }, false)
+            }
             Err(e) => (
                 Response::Error {
                     message: format!("{e:#}"),
@@ -205,6 +225,16 @@ async fn dispatch(req: Request, ctx: &ControlCtx) -> (Response, bool) {
                 false,
             ),
         },
+        Request::Clear => {
+            let n = ctx.forwards.clear().await;
+            persist(ctx).await;
+            (
+                Response::Ok {
+                    message: format!("dropped {n} forward(s)"),
+                },
+                false,
+            )
+        }
         Request::List => (
             Response::Forwards {
                 entries: entries(ctx).await,
@@ -217,9 +247,11 @@ async fn dispatch(req: Request, ctx: &ControlCtx) -> (Response, bool) {
                 Status::Reconnecting { attempt } => format!("reconnecting (attempt {attempt})"),
                 Status::Bootstrapping => "bootstrapping".to_string(),
             };
+            let agent_version = ctx.agent_version.borrow().clone();
             (
                 Response::StatusIs {
                     state,
+                    agent_version,
                     entries: entries(ctx).await,
                 },
                 false,
@@ -246,15 +278,30 @@ async fn dispatch(req: Request, ctx: &ControlCtx) -> (Response, bool) {
 }
 
 async fn entries(ctx: &ControlCtx) -> Vec<ForwardEntry> {
+    let connected = matches!(&*ctx.status.borrow(), Status::Connected);
     ctx.forwards
         .list()
         .await
         .into_iter()
-        .map(|(spec, local)| ForwardEntry {
-            spec: display_spec(&spec),
-            local: local.to_string(),
+        .map(|s| ForwardEntry {
+            spec: display_spec(&s.spec),
+            local: s.local.to_string(),
+            health: health_label(connected, &s),
         })
         .collect()
+}
+
+/// Render one forward's live health for `list`/`status`.
+fn health_label(connected: bool, s: &crate::client::ForwardSnapshot) -> String {
+    if !connected {
+        return "session reconnecting".to_string();
+    }
+    match (s.ok_connections, &s.last_error) {
+        (0, None) => "idle".to_string(),
+        (0, Some(err)) => format!("last error: {err}"),
+        (n, None) => format!("ok ({n} conns)"),
+        (n, Some(err)) => format!("ok ({n} conns); last error: {err}"),
+    }
 }
 
 async fn add_forward(spec: &str, ctx: &ControlCtx) -> Result<std::net::SocketAddr> {
@@ -285,7 +332,7 @@ async fn persist(ctx: &ControlCtx) {
         .list()
         .await
         .into_iter()
-        .map(|(spec, _)| display_spec(&spec))
+        .map(|s| display_spec(&s.spec))
         .collect();
     let target = ctx.persist.clone();
     let res = tokio::task::spawn_blocking(move || target.save_forwards(specs)).await;
@@ -378,9 +425,11 @@ mod tests {
 
         let resp = Response::StatusIs {
             state: "connected".into(),
+            agent_version: "0.1.0".into(),
             entries: vec![ForwardEntry {
                 spec: "127.0.0.1:8888->8888".into(),
                 local: "127.0.0.1:8888".into(),
+                health: "ok (1 conns)".into(),
             }],
         };
         let s = serde_json::to_string(&resp).unwrap();

@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -30,6 +31,34 @@ pub const ATTACH_DEADLINE: Duration = Duration::from_secs(10);
 /// Shared slot holding the current agent connection (`None` while reconnecting).
 pub type ConnSlot = watch::Receiver<Option<Connection>>;
 
+/// Live health of one forward, updated as connections through it succeed/fail.
+/// This is what lets `add`/`list`/`status` explain *why* a forward does nothing
+/// (e.g. the agent can't reach the target) instead of silently appearing "up".
+#[derive(Debug, Default)]
+pub struct ForwardHealth {
+    /// Connections that opened a stream and started splicing successfully.
+    pub ok_connections: u64,
+    /// Most recent connection failure (full cause chain), if any.
+    pub last_error: Option<String>,
+}
+
+/// Shared, cheaply-clonable handle to one forward's [`ForwardHealth`].
+pub type HealthHandle = Arc<StdMutex<ForwardHealth>>;
+
+/// Create a fresh, empty health handle.
+pub fn new_health_handle() -> HealthHandle {
+    Arc::new(StdMutex::new(ForwardHealth::default()))
+}
+
+/// Snapshot of one active forward for display (spec, bound addr, health).
+#[derive(Debug, Clone)]
+pub struct ForwardSnapshot {
+    pub spec: ForwardSpec,
+    pub local: SocketAddr,
+    pub ok_connections: u64,
+    pub last_error: Option<String>,
+}
+
 /// Create a connection slot pair.
 pub fn conn_slot(initial: Option<Connection>) -> (watch::Sender<Option<Connection>>, ConnSlot) {
     watch::channel(initial)
@@ -43,6 +72,7 @@ pub fn conn_slot(initial: Option<Connection>) -> (watch::Sender<Option<Connectio
 pub async fn bind_forward(
     slot: ConnSlot,
     forward: ForwardSpec,
+    health: HealthHandle,
 ) -> Result<(SocketAddr, JoinHandle<()>)> {
     let listener = TcpListener::bind((forward.local_addr, forward.local_port))
         .await
@@ -61,7 +91,7 @@ pub async fn bind_forward(
         ns = %forward.ns.to_wire(),
         "forward up"
     );
-    let handle = tokio::spawn(accept_loop(listener, slot, forward));
+    let handle = tokio::spawn(accept_loop(listener, slot, forward, health));
     Ok((local, handle))
 }
 
@@ -70,6 +100,7 @@ pub async fn bind_forward(
 pub struct ActiveForward {
     pub spec: ForwardSpec,
     pub local: SocketAddr,
+    health: HealthHandle,
     task: JoinHandle<()>,
 }
 
@@ -103,20 +134,22 @@ impl ForwardSet {
             }
         }
 
+        let health = new_health_handle();
         let preferred_port = bind_spec.local_port;
-        let (local, task) = match bind_forward(self.slot.clone(), bind_spec.clone()).await {
-            Ok(bound) => bound,
-            Err(e) if bind_spec.local_port_auto && preferred_port != 0 => {
-                warn!(
-                    local_port = preferred_port,
-                    error = %e,
-                    "preferred local port unavailable; falling back to a free port"
-                );
-                bind_spec.local_port = 0;
-                bind_forward(self.slot.clone(), bind_spec.clone()).await?
-            }
-            Err(e) => return Err(e),
-        };
+        let (local, task) =
+            match bind_forward(self.slot.clone(), bind_spec.clone(), health.clone()).await {
+                Ok(bound) => bound,
+                Err(e) if bind_spec.local_port_auto && preferred_port != 0 => {
+                    warn!(
+                        local_port = preferred_port,
+                        error = %e,
+                        "preferred local port unavailable; falling back to a free port"
+                    );
+                    bind_spec.local_port = 0;
+                    bind_forward(self.slot.clone(), bind_spec.clone(), health.clone()).await?
+                }
+                Err(e) => return Err(e),
+            };
 
         bind_spec.local_port = local.port();
         if local.port() != preferred_port && bind_spec.local_port_auto {
@@ -134,6 +167,7 @@ impl ForwardSet {
             ActiveForward {
                 spec: bind_spec,
                 local,
+                health,
                 task,
             },
         );
@@ -152,11 +186,34 @@ impl ForwardSet {
         Ok(fwd.spec)
     }
 
-    /// Snapshot of (spec, actual local addr) pairs, ordered by local port.
-    pub async fn list(&self) -> Vec<(ForwardSpec, SocketAddr)> {
+    /// Stop every forward, returning how many were removed.
+    pub async fn clear(&self) -> usize {
+        let mut active = self.active.lock().await;
+        let n = active.len();
+        for (_, fwd) in active.drain() {
+            fwd.task.abort();
+            info!(local = %fwd.local, "forward dropped");
+        }
+        n
+    }
+
+    /// Snapshot of all active forwards (spec, bound addr, health), ordered by
+    /// local port.
+    pub async fn list(&self) -> Vec<ForwardSnapshot> {
         let active = self.active.lock().await;
-        let mut out: Vec<_> = active.values().map(|f| (f.spec.clone(), f.local)).collect();
-        out.sort_by_key(|(_, l)| l.port());
+        let mut out: Vec<ForwardSnapshot> = active
+            .values()
+            .map(|f| {
+                let h = f.health.lock().unwrap();
+                ForwardSnapshot {
+                    spec: f.spec.clone(),
+                    local: f.local,
+                    ok_connections: h.ok_connections,
+                    last_error: h.last_error.clone(),
+                }
+            })
+            .collect();
+        out.sort_by_key(|s| s.local.port());
         out
     }
 
@@ -171,25 +228,40 @@ impl ForwardSet {
 }
 
 /// Accept local connections forever, fanning each onto its own QUIC stream.
-async fn accept_loop(listener: TcpListener, slot: ConnSlot, forward: ForwardSpec) {
+async fn accept_loop(
+    listener: TcpListener,
+    slot: ConnSlot,
+    forward: ForwardSpec,
+    health: HealthHandle,
+) {
     loop {
         match listener.accept().await {
             Ok((tcp, peer)) => {
                 debug!(%peer, "local connection accepted");
                 let slot = slot.clone();
                 let forward = forward.clone();
+                let health = health.clone();
                 let target = format!("{}:{}", forward.remote_host, forward.remote_port);
                 let ns = forward.ns.to_wire();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_one(slot, forward, tcp).await {
-                        let error = error::format_chain(&e);
-                        warn!(
-                            %peer,
-                            %target,
-                            %ns,
-                            %error,
-                            "forward connection failed"
-                        );
+                    match serve_one(slot, forward, tcp).await {
+                        Ok(()) => {
+                            health.lock().unwrap().ok_connections += 1;
+                        }
+                        Err(e) => {
+                            let error = error::format_chain(&e);
+                            {
+                                let mut h = health.lock().unwrap();
+                                h.last_error = Some(error.clone());
+                            }
+                            warn!(
+                                %peer,
+                                %target,
+                                %ns,
+                                %error,
+                                "forward connection failed"
+                            );
+                        }
                     }
                 });
             }
@@ -283,10 +355,24 @@ mod tests {
 
         assert_ne!(local.port(), preferred);
         let active = forwards.list().await;
-        assert_eq!(active[0].0.local_port, local.port());
-        assert!(active[0].0.local_port_auto);
+        assert_eq!(active[0].spec.local_port, local.port());
+        assert!(active[0].spec.local_port_auto);
 
         forwards.remove(local.port()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clear_removes_all_forwards() {
+        let (_slot_tx, slot_rx) = conn_slot(None);
+        let forwards = ForwardSet::new(slot_rx);
+
+        // Two distinct ephemeral forwards (port 0 -> free port each).
+        forwards.add(spec(0, false)).await.unwrap();
+        forwards.add(spec(0, false)).await.unwrap();
+        assert_eq!(forwards.list().await.len(), 2);
+
+        assert_eq!(forwards.clear().await, 2);
+        assert!(forwards.list().await.is_empty());
     }
 
     #[tokio::test]

@@ -6,8 +6,8 @@
 //!
 //! Wire format is one newline-terminated ASCII line per message:
 //! ```text
-//! PM-HELLO v1 <client_fp_hex> <token_hex>
-//! PM-READY v1 <udp_port> <agent_fp_hex> <session_id_hex>
+//! PM-HELLO v2 <client_fp_hex> <token_hex>
+//! PM-READY v2 <udp_port> <agent_fp_hex> <session_id_hex> <agent_version>
 //! PM-ERROR <message...>
 //! ```
 
@@ -17,7 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use crate::crypto::Fingerprint;
 
 /// Handshake/wire protocol version.
-pub const PROTO_VERSION: u32 = 1;
+pub const PROTO_VERSION: u32 = 2;
 
 const HELLO_TAG: &str = "PM-HELLO";
 const READY_TAG: &str = "PM-READY";
@@ -86,6 +86,8 @@ pub struct Ready {
     pub udp_port: u16,
     pub agent_fp: Fingerprint,
     pub session_id: SessionId,
+    /// Agent binary version (`CARGO_PKG_VERSION`), so the client can detect skew.
+    pub version: String,
 }
 
 impl Hello {
@@ -126,17 +128,18 @@ impl Ready {
     /// Serialize to the one-line wire form (newline-terminated).
     pub fn to_line(&self) -> String {
         format!(
-            "{READY_TAG} v{PROTO_VERSION} {} {} {}\n",
+            "{READY_TAG} v{PROTO_VERSION} {} {} {} {}\n",
             self.udp_port,
             self.agent_fp.to_hex(),
-            self.session_id.to_hex()
+            self.session_id.to_hex(),
+            self.version,
         )
     }
 
     /// Parse from a wire line (sync).
     pub fn parse_line(line: &str) -> Result<Self> {
         let parts = check_tagged_line(line, READY_TAG)?;
-        if parts.len() != 5 {
+        if parts.len() != 6 {
             bail!("malformed READY: wrong field count");
         }
         let udp_port = parts[2].parse::<u16>().context("invalid udp port")?;
@@ -144,6 +147,7 @@ impl Ready {
             udp_port,
             agent_fp: Fingerprint::from_hex(&parts[3])?,
             session_id: SessionId::from_hex(&parts[4])?,
+            version: parts[5].clone(),
         })
     }
 
@@ -246,12 +250,14 @@ mod tests {
             udp_port: 51820,
             agent_fp: id.fingerprint,
             session_id: SessionId::random().unwrap(),
+            version: "0.1.0".to_string(),
         };
         let mut buf = Vec::new();
         ready.write(&mut buf).await.unwrap();
         let mut r = BufReader::new(&buf[..]);
         let got = Ready::read(&mut r).await.unwrap();
         assert_eq!(got.udp_port, 51820);
+        assert_eq!(got.version, "0.1.0");
         assert!(got.session_id.ct_eq(&ready.session_id));
     }
 
@@ -272,6 +278,7 @@ mod tests {
             udp_port: 1234,
             agent_fp: id.fingerprint,
             session_id: SessionId::random().unwrap(),
+            version: "9.9.9".to_string(),
         };
         let mut buf = Vec::new();
         buf.extend_from_slice(b"\n\n");
