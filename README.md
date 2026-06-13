@@ -134,6 +134,13 @@ local = "same"       # mirror remote port; fall back to a free one
 - The agent's UDP listener is mutually authenticated, but it *is* a listening
   port run with your remote user's privileges; the grace window
   (`--grace-secs`, default 300) bounds how long it outlives a client.
+- One client per session. The control socket prevents a second client for the
+  same host on one machine; two separate launches get separate agent sessions.
+  Sharing a single session across clients (by copying its secrets) is
+  unsupported.
+- The accept-then-wait deadline for an in-flight local connection during an
+  outage defaults to 10s; raise it with `PORTMANAGER_ATTACH_DEADLINE_SECS` to
+  ride out longer reconnects without RSTing accepted connections.
 
 ## Build
 

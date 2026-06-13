@@ -351,7 +351,12 @@ pub fn display_spec(spec: &ForwardSpec) -> String {
     } else {
         format!("{ns}@")
     };
-    if spec.local_port_auto && spec.local_port == spec.remote_port {
+    if spec.local_port_auto {
+        // Auto local port: persist the short (preferred) form regardless of the
+        // actually-bound port. Otherwise a fallback to an ephemeral port would
+        // be written as a strict `->NNNNN` and frozen on the next launch,
+        // instead of re-preferring the original port. The live bound port is
+        // still visible in `list`'s local column.
         return format!("{prefix}{}:{}", spec.remote_host, spec.remote_port);
     }
     format!(
@@ -454,5 +459,25 @@ mod tests {
                 "display form {shown:?} must reparse identically"
             );
         }
+    }
+
+    #[test]
+    fn auto_port_fallback_is_not_frozen_on_persist() {
+        // Simulate an auto forward (`9001`) that fell back to an ephemeral local
+        // port at bind time: local_port_auto stays true but local_port != remote.
+        let spec = ForwardSpec {
+            ns: crate::forward::NsSpec::Host,
+            remote_host: "127.0.0.1".into(),
+            remote_port: 9001,
+            local_addr: std::net::Ipv4Addr::LOCALHOST.into(),
+            local_port: 45000,
+            local_port_auto: true,
+        };
+        // Persisted form must be the short (preferred) form, not `->45000`.
+        let shown = display_spec(&spec);
+        assert_eq!(shown, "127.0.0.1:9001");
+        let back: ForwardSpec = shown.parse().unwrap();
+        assert!(back.local_port_auto, "reparsed spec must stay auto");
+        assert_eq!(back.local_port, 9001, "must re-prefer the original port");
     }
 }
