@@ -34,6 +34,7 @@ use crate::agent::CLOSE_SHUTDOWN;
 use crate::bootstrap::{self, AgentSession};
 use crate::client::ConnSlot;
 use crate::crypto::{self, Timing};
+use crate::firewall::{self, AdvisePort};
 use crate::{client, netwatch, transport};
 
 /// Per-attempt QUIC handshake timeout during recovery.
@@ -86,15 +87,25 @@ impl Supervisor {
         let client_cfg = crypto::client_config(&session.client_id, session.agent_fp, &timing)?;
         let endpoint = transport::client_endpoint_bare()?;
 
-        let conn = connect_once(&endpoint, client_cfg.clone(), addr)
-            .await
-            .with_context(|| {
-                format!(
-                    "connecting to agent UDP listener at {} ({addr}); open/forward this UDP port \
-                     on the remote, or choose an allowed port with --remote-udp 0.0.0.0:<PORT>",
-                    session.quic_target
-                )
-            })?;
+        let conn = match connect_once(&endpoint, client_cfg.clone(), addr).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                // Inbound UDP blocked is the most common cause: diagnose the
+                // remote firewall over the SSH channel and show how to open it.
+                let advisory = firewall::diagnose(&host, advise_port(listen.as_deref())).await;
+                warn!(
+                    "could not reach the agent's UDP listener — inbound UDP may be blocked.\n{advisory}"
+                );
+                return Err(e).with_context(|| {
+                    format!(
+                        "connecting to agent UDP listener at {} ({addr}); open/forward this UDP \
+                         port on the remote, or choose an allowed port with \
+                         --remote-udp 0.0.0.0:<PORT>",
+                        session.quic_target
+                    )
+                });
+            }
+        };
         info!(target = %session.quic_target, "connected to agent");
         status_tx.send_replace(Status::Connected);
 
@@ -275,6 +286,19 @@ async fn monitor_loop(mut ctx: MonitorCtx) {
         ctx.status_tx.send_replace(Status::Connected);
         info!("session restored");
     }
+}
+
+/// Which UDP port (or the default range) to advise opening when the connect
+/// fails: a `--remote-udp host:PORT` names one port; otherwise the whole range.
+fn advise_port(listen: Option<&str>) -> AdvisePort {
+    listen
+        .and_then(|spec| spec.rsplit(':').next())
+        .and_then(|p| p.trim().parse::<u16>().ok())
+        .map(AdvisePort::Single)
+        .unwrap_or(AdvisePort::Range(
+            DEFAULT_UDP_PORT_START,
+            DEFAULT_UDP_PORT_END,
+        ))
 }
 
 async fn bootstrap_agent(host: &str, listen: Option<&str>, verbose: u8) -> Result<AgentSession> {
