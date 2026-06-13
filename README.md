@@ -201,6 +201,26 @@ it differently), and the control socket lives inside the container — use the
 foreground form, or `docker exec` into the same container for `add`/`list`.
 Multi-arch: `docker buildx build --platform linux/amd64,linux/arm64 .`.
 
+#### Published image
+
+Released images are pushed to Docker Hub as
+[`lacraig2/portmanager`](https://hub.docker.com/r/lacraig2/portmanager):
+
+```console
+$ docker pull lacraig2/portmanager:latest
+$ docker run --rm -it --network host \
+    --user "$(id -u):$(id -g)" -v /etc/passwd:/etc/passwd:ro \
+    -v "$HOME/.ssh:$HOME/.ssh:ro" -e HOME="$HOME" \
+    lacraig2/portmanager myhost 8888
+```
+
+CI builds and pushes a multi-arch manifest (`linux/amd64`, `linux/arm64`) on
+pushes to `main` (`:latest`) and on `vX.Y.Z` tags (versioned), via
+`.github/workflows/docker.yml`. That workflow needs two repo secrets:
+`DOCKERHUB_USERNAME` (`lacraig2`) and `DOCKERHUB_TOKEN` (a Docker Hub access
+token). To publish by hand instead: `docker login -u lacraig2 && scripts/pm.sh
+docker-push`.
+
 ## Test
 
 ```console

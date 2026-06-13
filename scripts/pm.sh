@@ -16,6 +16,7 @@
 #   scripts/pm.sh agents           # (re)build just the bundled agents
 #   scripts/pm.sh docker-build      # build the slim Docker image (portmanager:local)
 #   scripts/pm.sh docker-run [ARGS] # run the client from the Docker image
+#   scripts/pm.sh docker-push [REPO[:TAG]] # build + push to a registry (needs docker login)
 #   scripts/pm.sh clean            # remove the dist package dir
 #   scripts/pm.sh help
 #
@@ -161,6 +162,20 @@ cmd_docker_run() {
     exec docker run "${args[@]}" "$DOCKER_IMAGE" "$@"
 }
 
+# Build and push the image to a registry. Single-arch (host) for a quick manual
+# publish — multi-arch publishing is CI's job (.github/workflows/docker.yml).
+# Requires `docker login` as an account with push access to REPO.
+cmd_docker_push() {
+    command -v docker >/dev/null 2>&1 || die "docker not found"
+    local ref="${1:-lacraig2/portmanager:latest}"
+    [[ "$ref" == *:* ]] || ref="$ref:latest"
+    log "building $ref"
+    docker build -t "$ref" .
+    log "pushing $ref (must be 'docker login'd as an account with push access)"
+    docker push "$ref"
+    log "pushed $ref"
+}
+
 # Print the leading comment block (after the shebang), stripping `# `.
 cmd_help() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
 
@@ -176,6 +191,7 @@ main() {
         package) cmd_package "$@" ;;
         docker-build) cmd_docker_build "$@" ;;
         docker-run)   cmd_docker_run "$@" ;;
+        docker-push)  cmd_docker_push "$@" ;;
         clean)   cmd_clean "$@" ;;
         help|-h|--help) cmd_help ;;
         *) die "unknown subcommand '$sub' (try '$0 help')" ;;
