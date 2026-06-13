@@ -14,6 +14,13 @@
 //! The loop never abandons the session: capped exponential backoff with full
 //! jitter, forever, exactly like mosh's `[network outage]` behavior. Local
 //! listeners stay bound throughout (see `client.rs`).
+//!
+//! **Single client per session.** A supervisor owns exactly one logical session
+//! and assumes it is the only client of its agent. On one machine the control
+//! socket (`control.rs`) already refuses a second client for the same host. Two
+//! independent launches bootstrap *separate* agent sessions (random token, own
+//! UDP port), so they don't collide. Pointing two clients at one session (by
+//! copying its secrets) is unsupported and undefined.
 
 use std::net::SocketAddr;
 use std::time::Duration;

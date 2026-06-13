@@ -44,7 +44,7 @@ async fn session() -> quinn::Connection {
     let server_cfg = crypto::server_config(&agent_id, client_id.fingerprint, &timing).unwrap();
     let ep = transport::server_endpoint(server_cfg, (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
     let addr = ep.local_addr().unwrap();
-    tokio::spawn(agent::serve_with_grace(ep, TEST_GRACE));
+    tokio::spawn(agent::serve_with_grace(ep, TEST_GRACE, None));
 
     let client_cfg = crypto::client_config(&client_id, agent_id.fingerprint, &timing).unwrap();
     let client_ep = transport::client_endpoint(client_cfg).unwrap();
