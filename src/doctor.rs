@@ -98,7 +98,18 @@ pub async fn run(host: &str) -> Result<()> {
         ),
     }
 
-    // 5. Tail the remote agent log, if present.
+    // 5. Firewall: the agent's UDP port must be reachable. Report the active
+    // host firewall and how to open the default mosh-style range.
+    if hostname.is_some() {
+        let advisory =
+            crate::firewall::diagnose(host, crate::firewall::AdvisePort::Range(60000, 61000)).await;
+        println!("\nfirewall (agent UDP must be reachable):");
+        for line in advisory.lines() {
+            println!("  {line}");
+        }
+    }
+
+    // 6. Tail the remote agent log, if present.
     if hostname.is_some() {
         match bootstrap::ssh_capture(host, &["tail", "-n", "10", ".cache/portmanager/agent.log"])
             .await

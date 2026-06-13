@@ -12,6 +12,7 @@ pub mod crypto;
 pub mod discovery;
 pub mod doctor;
 pub mod error;
+pub mod firewall;
 pub mod forward;
 pub mod handshake;
 pub mod netns;

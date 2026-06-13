@@ -265,6 +265,33 @@ done
     }
 }
 
+/// Run a shell `script` on `host` by feeding it to a remote `sh -s` over SSH
+/// (stdin), capturing stdout. Avoids remote-shell re-quoting of multi-line
+/// scripts. Used for best-effort probes (e.g. firewall detection).
+pub(crate) async fn ssh_script(host: &str, script: &str) -> Result<String> {
+    let mut child = Command::new("ssh")
+        .arg("-o")
+        .arg(SSH_CONNECT_TIMEOUT)
+        .arg(host)
+        .arg("sh")
+        .arg("-s")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("launching ssh sh -s")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let _ = stdin.write_all(script.as_bytes()).await;
+        let _ = stdin.shutdown().await;
+    }
+    let out = child
+        .wait_with_output()
+        .await
+        .context("running ssh script")?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Resolve the real hostname for an SSH alias via `ssh -G`.
 async fn ssh_hostname(host: &str) -> Result<String> {
     let out = ssh_g(host).await?;
