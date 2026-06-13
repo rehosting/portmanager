@@ -38,7 +38,7 @@ fn spawn_agent(
     let server_cfg = crypto::server_config(agent_id, client_fp, timing).unwrap();
     let ep = transport::server_endpoint(server_cfg, (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
     let addr = ep.local_addr().unwrap();
-    tokio::spawn(agent::serve_with_grace(ep, TEST_GRACE));
+    tokio::spawn(agent::serve_with_grace(ep, TEST_GRACE, None));
     addr
 }
 

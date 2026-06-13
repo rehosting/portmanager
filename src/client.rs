@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -24,9 +24,25 @@ use crate::error;
 use crate::forward::ForwardSpec;
 use crate::proto::{self, StreamHeader};
 
+/// Default seconds an accepted local connection waits for a live agent
+/// connection (e.g. mid-reconnect) before being dropped.
+const ATTACH_DEADLINE_DEFAULT_SECS: u64 = 10;
+
 /// How long an accepted local connection waits for a live agent connection
-/// (e.g. mid-reconnect) before being dropped.
-pub const ATTACH_DEADLINE: Duration = Duration::from_secs(10);
+/// before being dropped. Defaults to [`ATTACH_DEADLINE_DEFAULT_SECS`]; override
+/// with `PORTMANAGER_ATTACH_DEADLINE_SECS` (raise it to ride out long outages
+/// without RSTing in-flight accepts). Read once and cached.
+pub fn attach_deadline() -> Duration {
+    static CACHE: OnceLock<Duration> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let secs = std::env::var("PORTMANAGER_ATTACH_DEADLINE_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&s| s > 0)
+            .unwrap_or(ATTACH_DEADLINE_DEFAULT_SECS);
+        Duration::from_secs(secs)
+    })
+}
 
 /// Shared slot holding the current agent connection (`None` while reconnecting).
 pub type ConnSlot = watch::Receiver<Option<Connection>>;
@@ -274,7 +290,7 @@ async fn accept_loop(
 }
 
 /// Open a stream for one accepted TCP connection and splice. If the session is
-/// mid-reconnect, wait up to [`ATTACH_DEADLINE`] for a live connection; if a
+/// mid-reconnect, wait up to [`attach_deadline`] for a live connection; if a
 /// stale connection fails at open, wait for a replacement within the same
 /// deadline rather than failing immediately.
 async fn serve_one(mut slot: ConnSlot, forward: ForwardSpec, tcp: TcpStream) -> Result<()> {
@@ -284,7 +300,7 @@ async fn serve_one(mut slot: ConnSlot, forward: ForwardSpec, tcp: TcpStream) -> 
         port: forward.remote_port,
     };
 
-    let deadline = tokio::time::Instant::now() + ATTACH_DEADLINE;
+    let deadline = tokio::time::Instant::now() + attach_deadline();
     loop {
         // Wait (bounded) for a live connection.
         let conn = loop {

@@ -200,10 +200,13 @@ pub async fn bootstrap(host: &str, listen: &str, verbose: u8) -> Result<AgentSes
 }
 
 /// Terminate any daemonized agent recorded on `host` whose version differs from
-/// `version` (the binary we are about to launch). Best-effort: a failure here
-/// just means a stale agent lingers until its grace window, so errors are
-/// logged at debug and swallowed. The script also prunes state files for dead
-/// pids. The reap script is fed over stdin to avoid remote-shell quoting.
+/// `version` (the binary we are about to launch) **and that has no client
+/// currently attached** (`clients == 0`, or the field is absent on a
+/// pre-upgrade agent). An agent actively serving a client is left alone, so the
+/// reap never drops a live session. Best-effort: a failure here just means a
+/// stale agent lingers until its grace window, so errors are logged at debug
+/// and swallowed. The script also prunes state files for dead pids and is fed
+/// over stdin to avoid remote-shell quoting.
 async fn reap_stale_agents(host: &str, version: &str) {
     const SCRIPT: &str = r#"
 ver="$1"
@@ -213,10 +216,12 @@ for f in "$dir"/*.json; do
   [ -e "$f" ] || continue
   v=$(sed -n 's/.*"version":"\([^"]*\)".*/\1/p' "$f")
   p=$(sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' "$f")
+  c=$(sed -n 's/.*"clients":\([0-9][0-9]*\).*/\1/p' "$f")
+  [ -n "$c" ] || c=0
   [ -n "$p" ] || { rm -f "$f"; continue; }
   if ! kill -0 "$p" 2>/dev/null; then rm -f "$f"; continue; fi
-  if [ "$v" != "$ver" ]; then
-    kill -TERM "$p" 2>/dev/null && echo "reaped stale agent pid=$p version=$v"
+  if [ "$v" != "$ver" ] && [ "$c" -eq 0 ]; then
+    kill -TERM "$p" 2>/dev/null && echo "reaped idle stale agent pid=$p version=$v"
     rm -f "$f"
   fi
 done

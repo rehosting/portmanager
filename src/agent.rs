@@ -72,13 +72,16 @@ pub fn run(listen: &str, grace: Duration, foreground: bool) -> Result<()> {
         daemonize()?;
     }
 
-    // Record this agent (pid/port/version) so a future client can detect a
-    // stale version and evict it — see bootstrap::reap_stale_agents.
+    // Record this agent (pid/port/version/clients) so a future client can detect
+    // a stale version and evict it only when idle — see bootstrap::reap_stale_agents.
     let state_path = if foreground {
         None
     } else {
         write_agent_state(local.port())
     };
+    // serve_with_grace updates the live client count in this file; it needs its
+    // own copy since the path is also used for cleanup after the runtime exits.
+    let state_path_for_serve = state_path.clone();
 
     // 4. Now start the runtime and serve.
     let server_cfg = crypto::server_config(&identity, hello.client_fp, &crypto::Timing::default())?;
@@ -97,7 +100,7 @@ pub fn run(listen: &str, grace: Duration, foreground: bool) -> Result<()> {
             Arc::new(quinn::TokioRuntime),
         )
         .context("building QUIC endpoint")?;
-        serve_with_grace(endpoint, grace).await
+        serve_with_grace(endpoint, grace, state_path_for_serve).await
     });
 
     // Clean up the state file on a graceful exit (best-effort).
@@ -118,14 +121,21 @@ fn write_agent_state(udp_port: u16) -> Option<std::path::PathBuf> {
     let dir = agent_state_dir()?;
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join(format!("{udp_port}.json"));
+    write_agent_state_at(&path, udp_port, 0);
+    Some(path)
+}
+
+/// (Re)write the agent state file with the current live client count. The
+/// reaper uses `clients` to avoid evicting an agent that is actively serving.
+fn write_agent_state_at(path: &std::path::Path, udp_port: u16, clients: usize) {
     let body = format!(
-        r#"{{"pid":{},"udp_port":{},"version":"{}"}}"#,
+        r#"{{"pid":{},"udp_port":{},"version":"{}","clients":{}}}"#,
         std::process::id(),
         udp_port,
         env!("CARGO_PKG_VERSION"),
+        clients,
     );
-    std::fs::write(&path, body).ok()?;
-    Some(path)
+    let _ = std::fs::write(path, body);
 }
 
 /// Read the HELLO line from real (blocking) stdin.
@@ -175,11 +185,16 @@ fn daemonize() -> Result<()> {
         .create(true)
         .append(true)
         .open(log_dir.join("agent.log"))
-        .unwrap_or_else(|_| devnull.try_clone().expect("clone devnull"));
+        .ok();
 
     nix::unistd::dup2_stdin(&devnull).context("detaching stdin")?;
     nix::unistd::dup2_stdout(&devnull).context("detaching stdout")?;
-    nix::unistd::dup2_stderr(&log).context("redirecting stderr to log")?;
+    // Redirect stderr to the log file when available, else to /dev/null —
+    // best-effort, never panic post-fork.
+    match &log {
+        Some(l) => nix::unistd::dup2_stderr(l).context("redirecting stderr to log")?,
+        None => nix::unistd::dup2_stderr(&devnull).context("detaching stderr")?,
+    }
     Ok(())
 }
 
@@ -191,7 +206,11 @@ fn daemonize() -> Result<()> {
 /// Accept connections, tracking how many are live; exit when the grace window
 /// elapses with none attached (covers both "client gone" and "never connected"),
 /// or immediately on an explicit shutdown close.
-pub async fn serve_with_grace(endpoint: Endpoint, grace: Duration) -> Result<()> {
+pub async fn serve_with_grace(
+    endpoint: Endpoint,
+    grace: Duration,
+    state_path: Option<std::path::PathBuf>,
+) -> Result<()> {
     info!(addr = ?endpoint.local_addr().ok(), grace_secs = grace.as_secs(), "agent listening");
 
     // (active connection count, explicit-shutdown flag)
@@ -199,6 +218,22 @@ pub async fn serve_with_grace(endpoint: Endpoint, grace: Duration) -> Result<()>
     // Namespace connect-helpers live as long as the session (reused across
     // client reconnects, torn down when the agent exits).
     let pool = Arc::new(HelperPool::new());
+
+    // Mirror the live client count into the state file so a future bootstrap's
+    // reaper only evicts this agent when it is idle (clients == 0).
+    if let Some(path) = state_path {
+        let udp_port = endpoint.local_addr().map(|a| a.port()).unwrap_or(0);
+        let mut rx = state_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                let clients = rx.borrow_and_update().0;
+                write_agent_state_at(&path, udp_port, clients);
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     let accept_endpoint = endpoint.clone();
     let accept = tokio::spawn(async move {
