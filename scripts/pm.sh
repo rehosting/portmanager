@@ -14,6 +14,9 @@
 #   scripts/pm.sh run [ARGS...]    # run the packaged client (builds it if missing)
 #   scripts/pm.sh package          # tar.gz the package dir for distribution
 #   scripts/pm.sh agents           # (re)build just the bundled agents
+#   scripts/pm.sh docker-build      # build the slim Docker image (portmanager:local)
+#   scripts/pm.sh docker-run [ARGS] # run the client from the Docker image
+#   scripts/pm.sh docker-push [REPO[:TAG]] # build + push to a registry (needs docker login)
 #   scripts/pm.sh clean            # remove the dist package dir
 #   scripts/pm.sh help
 #
@@ -128,6 +131,51 @@ cmd_clean() {
     log "removed $(pkg_dir)"
 }
 
+DOCKER_IMAGE="${PORTMANAGER_IMAGE:-portmanager:local}"
+
+cmd_docker_build() {
+    command -v docker >/dev/null 2>&1 || die "docker not found"
+    log "building image $DOCKER_IMAGE"
+    docker build -t "$DOCKER_IMAGE" "$@" .
+    log "built $DOCKER_IMAGE"
+}
+
+# Run the client from the image with the mounts SSH needs. Uses host networking
+# so forwarded local ports are reachable on the host's loopback, and runs as the
+# invoking user (with /etc/passwd mounted) so SSH key ownership/perms match.
+cmd_docker_run() {
+    command -v docker >/dev/null 2>&1 || die "docker not found"
+    local args=(
+        --rm -it
+        --network host
+        --user "$(id -u):$(id -g)"
+        -v /etc/passwd:/etc/passwd:ro
+        -v /etc/group:/etc/group:ro
+        -v "$HOME/.ssh:$HOME/.ssh:ro"
+        -e HOME="$HOME"
+    )
+    # Forward the SSH agent socket if one is available.
+    if [[ -n "${SSH_AUTH_SOCK:-}" && -S "${SSH_AUTH_SOCK:-}" ]]; then
+        args+=(-v "$SSH_AUTH_SOCK:$SSH_AUTH_SOCK" -e "SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
+    fi
+    log "docker run $DOCKER_IMAGE $*"
+    exec docker run "${args[@]}" "$DOCKER_IMAGE" "$@"
+}
+
+# Build and push the image to a registry. Single-arch (host) for a quick manual
+# publish — multi-arch publishing is CI's job (.github/workflows/docker.yml).
+# Requires `docker login` as an account with push access to REPO.
+cmd_docker_push() {
+    command -v docker >/dev/null 2>&1 || die "docker not found"
+    local ref="${1:-lacraig2/portmanager:latest}"
+    [[ "$ref" == *:* ]] || ref="$ref:latest"
+    log "building $ref"
+    docker build -t "$ref" .
+    log "pushing $ref (must be 'docker login'd as an account with push access)"
+    docker push "$ref"
+    log "pushed $ref"
+}
+
 # Print the leading comment block (after the shebang), stripping `# `.
 cmd_help() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
 
@@ -141,6 +189,9 @@ main() {
         check)   cmd_check "$@" ;;
         run)     cmd_run "$@" ;;
         package) cmd_package "$@" ;;
+        docker-build) cmd_docker_build "$@" ;;
+        docker-run)   cmd_docker_run "$@" ;;
+        docker-push)  cmd_docker_push "$@" ;;
         clean)   cmd_clean "$@" ;;
         help|-h|--help) cmd_help ;;
         *) die "unknown subcommand '$sub' (try '$0 help')" ;;
