@@ -289,14 +289,19 @@ async fn run_client(
         );
     }
 
-    let supervisor = Supervisor::start(host.clone(), args.remote_udp.clone(), verbose)
-        .await
-        .map_err(|e| {
-            e.context(
-                "session bootstrap failed — note the remote must allow inbound UDP \
+    let supervisor = Supervisor::start(
+        host.clone(),
+        args.remote_udp.clone(),
+        verbose,
+        args.agent_grace.as_secs(),
+    )
+    .await
+    .map_err(|e| {
+        e.context(
+            "session bootstrap failed — note the remote must allow inbound UDP \
                  (not just SSH/22) for the QUIC channel",
-            )
-        })?;
+        )
+    })?;
 
     let forward_set = Arc::new(ForwardSet::new(supervisor.slot.clone()));
     for (forward, origin) in forwards {

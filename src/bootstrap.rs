@@ -128,8 +128,14 @@ pub(crate) fn agent_binary_for(triple: &str, remote_arch: &str) -> Result<std::p
 /// Bootstrap an agent on `host` listening on `listen` (a UDP bind spec).
 ///
 /// `verbose` is the client's `-v` count, threaded to the agent so remote logs
-/// match the requested verbosity.
-pub async fn bootstrap(host: &str, listen: &str, verbose: u8) -> Result<AgentSession> {
+/// match the requested verbosity. `grace_secs` is how long the agent holds the
+/// session open after the last client disconnects before self-reaping.
+pub async fn bootstrap(
+    host: &str,
+    listen: &str,
+    verbose: u8,
+    grace_secs: u64,
+) -> Result<AgentSession> {
     let hostname = ssh_hostname(host).await?;
 
     let uname = ssh_capture(host, &["uname", "-sm"])
@@ -157,7 +163,9 @@ pub async fn bootstrap(host: &str, listen: &str, verbose: u8) -> Result<AgentSes
         .arg(&remote_path)
         .arg("agent")
         .arg("--listen")
-        .arg(listen);
+        .arg(listen)
+        .arg("--grace-secs")
+        .arg(grace_secs.to_string());
     for _ in 0..verbose {
         cmd.arg("-v");
     }
