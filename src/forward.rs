@@ -159,16 +159,16 @@ impl FromStr for ForwardSpec {
 
         let (remote_host, remote_port) = parse_host_port(remote_part, raw)?;
 
-        let local_port = match local_part {
-            Some(l) => parse_port(l, raw)?,
-            None => remote_port,
+        let (local_addr, local_port) = match local_part {
+            Some(l) => parse_bind_port(l, raw)?,
+            None => (Self::DEFAULT_LOCAL_ADDR, remote_port),
         };
 
         Ok(ForwardSpec {
             ns,
             remote_host,
             remote_port,
-            local_addr: Self::DEFAULT_LOCAL_ADDR,
+            local_addr,
             local_port,
             local_port_auto: local_part.is_none(),
         })
@@ -208,6 +208,46 @@ fn parse_host_port(s: &str, raw: &str) -> Result<(String, u16), SpecError> {
             Ok((host, parse_port(port, raw)?))
         }
     }
+}
+
+/// Parse the local part `[BINDADDR:]PORT` into a (bind address, port). When no
+/// bind address is given it defaults to loopback. Bracketed IPv6 (`[::]:PORT`)
+/// is supported, mirroring the remote-side host grammar. The bind address is
+/// how "visibility" is expressed: loopback (private) vs `0.0.0.0` (exposed).
+fn parse_bind_port(s: &str, raw: &str) -> Result<(IpAddr, u16), SpecError> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(SpecError::MissingPort(raw.to_string()));
+    }
+
+    // Bracketed IPv6 bind: [addr]:port
+    if let Some(after) = s.strip_prefix('[') {
+        let (addr, rest) = after.split_once(']').ok_or_else(|| {
+            SpecError::Malformed(
+                raw.to_string(),
+                "unterminated '[' in local bind address".into(),
+            )
+        })?;
+        let port = rest
+            .strip_prefix(':')
+            .ok_or_else(|| SpecError::MissingPort(raw.to_string()))?;
+        return Ok((parse_bind_addr(addr, raw)?, parse_port(port, raw)?));
+    }
+
+    match s.rsplit_once(':') {
+        // No bind address: bare local port -> loopback.
+        None => Ok((ForwardSpec::DEFAULT_LOCAL_ADDR, parse_port(s, raw)?)),
+        Some((addr, port)) => Ok((parse_bind_addr(addr, raw)?, parse_port(port, raw)?)),
+    }
+}
+
+fn parse_bind_addr(s: &str, raw: &str) -> Result<IpAddr, SpecError> {
+    s.parse::<IpAddr>().map_err(|e| {
+        SpecError::Malformed(
+            raw.to_string(),
+            format!("invalid local bind address {s:?}: {e}"),
+        )
+    })
 }
 
 fn parse_port(s: &str, raw: &str) -> Result<u16, SpecError> {
@@ -274,6 +314,47 @@ mod tests {
         assert_eq!(f.remote_port, 5432);
         assert_eq!(f.local_port, 5432);
         assert!(f.local_port_auto);
+    }
+
+    #[test]
+    fn local_bind_address() {
+        let f = parse("8080->0.0.0.0:8080");
+        assert_eq!(f.remote_host, "127.0.0.1");
+        assert_eq!(f.remote_port, 8080);
+        assert_eq!(f.local_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(f.local_port, 8080);
+        assert!(!f.local_port_auto, "an explicit bind pins the local port");
+    }
+
+    #[test]
+    fn local_bind_address_with_remote_host_and_ns() {
+        let f = parse("podman:web@10.88.0.5:5432->0.0.0.0:15432");
+        assert_eq!(f.ns, NsSpec::Podman("web".into()));
+        assert_eq!(f.remote_host, "10.88.0.5");
+        assert_eq!(f.remote_port, 5432);
+        assert_eq!(f.local_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(f.local_port, 15432);
+    }
+
+    #[test]
+    fn local_bind_address_bracketed_ipv6() {
+        let f = parse("8080->[::]:9090");
+        assert_eq!(f.local_addr, "::".parse::<IpAddr>().unwrap());
+        assert_eq!(f.local_port, 9090);
+    }
+
+    #[test]
+    fn bare_local_port_stays_loopback() {
+        let f = parse("192.168.4.2:8080->8080");
+        assert_eq!(f.local_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn rejects_bad_bind_address() {
+        assert!(matches!(
+            "8080->nope:9090".parse::<ForwardSpec>(),
+            Err(SpecError::Malformed(..))
+        ));
     }
 
     #[test]

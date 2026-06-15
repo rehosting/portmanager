@@ -8,11 +8,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use portmanager::client::{ForwardSet, conn_slot};
+// Only used by the Linux-gated discovery test below.
+#[cfg(target_os = "linux")]
 use portmanager::config::AutoForwardRule;
 use portmanager::control::{self, ControlCtx, Request, Response};
 use portmanager::crypto::{self, Identity, Timing};
+#[cfg(target_os = "linux")]
+use portmanager::discovery;
 use portmanager::supervisor::Status;
-use portmanager::{agent, discovery, transport};
+use portmanager::{agent, transport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -174,6 +178,7 @@ async fn discovery_autoforwards_new_listener() {
         slot_rx,
         forwards.clone(),
         rules,
+        None,
     ));
 
     // Wait for the scanner to find it and the watcher to bind it.
