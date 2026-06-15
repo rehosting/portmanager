@@ -28,13 +28,14 @@ portmanager  myhost  connected  agent v0.1.0
 │▶ 8888   127.0.0.1:8888       node (5123)       host       private     user    │
 │  5432   10.88.0.5:5432       postgres (1847)   podman:web private     user    │
 └───────────────────────────────────────────────────────────────────────────────┘
- a add  d drop  v visibility  ↑/↓ select  q quit
+ a add  d drop  o open  v visibility  ↑/↓ select  q quit
 ```
 
-Keys: `a` add a forward (type any spec), `d` drop the selected one, `v` toggle
-its visibility (loopback ↔ exposed on `0.0.0.0`), `q` quit. "Running Process" is
-resolved on the remote (Linux remotes only). Piped/non-TTY invocations fall back
-to plain logging.
+Keys: `a` add a forward (type any spec), `d` drop the selected one, `o` open it
+in your web browser (`http://127.0.0.1:<port>`), `v` toggle its visibility
+(loopback ↔ exposed on `0.0.0.0`), `q` quit. "Running Process" is resolved on
+the remote (Linux remotes only). Piped/non-TTY invocations fall back to plain
+logging.
 
 Run the local client in the background (no TUI) with `-d`/`--daemon`:
 
