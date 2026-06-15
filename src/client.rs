@@ -80,6 +80,19 @@ pub fn conn_slot(initial: Option<Connection>) -> (watch::Sender<Option<Connectio
     watch::channel(initial)
 }
 
+/// Step between successive human-friendly fallback ports. Keeps the low digits
+/// of the preferred port intact (80 -> 1080 -> 2080 -> ...) so a bumped port is
+/// still recognizable as "the one for 80".
+const LOCAL_PORT_STEP: u16 = 1000;
+
+/// Human-friendly fallback ports for a preferred local port: the preferred port
+/// itself, then +1000, +2000, ... up to the last value that still fits in a
+/// u16. For example 80 -> 80, 1080, 2080, ..., 65080. Callers append a final
+/// `0` (OS-assigned ephemeral) as the last resort once every rung is taken.
+fn fallback_ports(preferred: u16) -> impl Iterator<Item = u16> {
+    std::iter::successors(Some(preferred), |p| p.checked_add(LOCAL_PORT_STEP))
+}
+
 /// Bind the local listener for `forward` and start serving it against whatever
 /// connection the slot currently holds.
 ///
@@ -137,38 +150,53 @@ impl ForwardSet {
     }
 
     /// Bind and start a forward. Returns the actual local address. Omitted
-    /// local ports prefer the remote port and fall back to a free ephemeral
-    /// port if that local port is unavailable.
+    /// local ports prefer the remote port; if it is unavailable they walk a
+    /// human-friendly ladder (80 -> 1080 -> 2080 -> ...) and finally fall back
+    /// to a free ephemeral port if every rung is taken.
     pub async fn add(&self, spec: ForwardSpec) -> Result<SocketAddr> {
         let mut active = self.active.lock().await;
         let mut bind_spec = spec.clone();
-        if bind_spec.local_port != 0 && active.contains_key(&bind_spec.local_port) {
-            if bind_spec.local_port_auto {
-                bind_spec.local_port = 0;
-            } else {
+        let preferred_port = bind_spec.local_port;
+        let health = new_health_handle();
+
+        let (local, task) = if bind_spec.local_port_auto && preferred_port != 0 {
+            // Try the preferred port, then 1080/2080/..., skipping ports we
+            // already serve, then a final OS-assigned ephemeral port (0).
+            let mut bound = None;
+            let mut last_err = None;
+            for candidate in fallback_ports(preferred_port).chain(std::iter::once(0)) {
+                if candidate != 0 && active.contains_key(&candidate) {
+                    continue;
+                }
+                bind_spec.local_port = candidate;
+                match bind_forward(self.slot.clone(), bind_spec.clone(), health.clone()).await {
+                    Ok(b) => {
+                        bound = Some(b);
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(
+                            local_port = candidate,
+                            error = %e,
+                            "local port unavailable; trying next fallback"
+                        );
+                        last_err = Some(e);
+                    }
+                }
+            }
+            // The trailing 0 lets the OS pick, so failing every rung is rare;
+            // surface the last bind error if it somehow happens.
+            bound.ok_or_else(|| last_err.expect("fallback ladder yields at least one port"))?
+        } else {
+            // Strict explicit port, or an already-ephemeral (0) request: one shot.
+            if bind_spec.local_port != 0 && active.contains_key(&bind_spec.local_port) {
                 bail!("local port {} is already forwarded", bind_spec.local_port);
             }
-        }
-
-        let health = new_health_handle();
-        let preferred_port = bind_spec.local_port;
-        let (local, task) =
-            match bind_forward(self.slot.clone(), bind_spec.clone(), health.clone()).await {
-                Ok(bound) => bound,
-                Err(e) if bind_spec.local_port_auto && preferred_port != 0 => {
-                    warn!(
-                        local_port = preferred_port,
-                        error = %e,
-                        "preferred local port unavailable; falling back to a free port"
-                    );
-                    bind_spec.local_port = 0;
-                    bind_forward(self.slot.clone(), bind_spec.clone(), health.clone()).await?
-                }
-                Err(e) => return Err(e),
-            };
+            bind_forward(self.slot.clone(), bind_spec.clone(), health.clone()).await?
+        };
 
         bind_spec.local_port = local.port();
-        if local.port() != preferred_port && bind_spec.local_port_auto {
+        if local.port() != preferred_port && bind_spec.local_port_auto && preferred_port != 0 {
             info!(
                 preferred = preferred_port,
                 actual = local.port(),
@@ -358,6 +386,42 @@ mod tests {
             local_port,
             local_port_auto,
         }
+    }
+
+    #[test]
+    fn fallback_ladder_bumps_thousands_until_it_overflows() {
+        let rungs: Vec<u16> = fallback_ports(80).take(4).collect();
+        assert_eq!(rungs, vec![80, 1080, 2080, 3080]);
+
+        // Last reachable rung keeps the suffix, then stops before overflowing.
+        let all: Vec<u16> = fallback_ports(80).collect();
+        assert_eq!(*all.last().unwrap(), 65080);
+
+        // A preferred port whose next rung would overflow yields only itself.
+        assert_eq!(fallback_ports(65000).collect::<Vec<_>>(), vec![65000]);
+    }
+
+    #[tokio::test]
+    async fn omitted_local_port_falls_back_to_next_rung_when_preferred_is_busy() {
+        // Bind a preferred port whose +1000 rung is free, so the ladder lands
+        // on preferred+1000 rather than an OS-assigned ephemeral port.
+        let busy = loop {
+            let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            if let Some(next) = port.checked_add(LOCAL_PORT_STEP) {
+                if TcpListener::bind((Ipv4Addr::LOCALHOST, next)).await.is_ok() {
+                    break l; // `next` is free (the probe listener dropped here)
+                }
+            }
+        };
+        let preferred = busy.local_addr().unwrap().port();
+        let (_slot_tx, slot_rx) = conn_slot(None);
+        let forwards = ForwardSet::new(slot_rx);
+
+        let local = forwards.add(spec(preferred, true)).await.unwrap();
+
+        assert_eq!(local.port(), preferred + LOCAL_PORT_STEP);
+        forwards.remove(local.port()).await.unwrap();
     }
 
     #[tokio::test]
