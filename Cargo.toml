@@ -6,12 +6,14 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
+crossterm = "0.28"
 data-encoding = "2.11.0"
 directories = "6.0.0"
 getrandom = "0.4.2"
 hex = "0.4.3"
 nix = { version = "0.31.3", features = ["net", "socket", "sched", "process", "user", "fs", "uio"] }
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+ratatui = "0.29"
 rcgen = "0.14.7"
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 serde = { version = "1.0.228", features = ["derive"] }
