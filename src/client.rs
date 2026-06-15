@@ -436,10 +436,10 @@ mod tests {
         let busy = loop {
             let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
             let port = l.local_addr().unwrap().port();
-            if let Some(next) = port.checked_add(LOCAL_PORT_STEP) {
-                if TcpListener::bind((Ipv4Addr::LOCALHOST, next)).await.is_ok() {
-                    break l; // `next` is free (the probe listener dropped here)
-                }
+            if let Some(next) = port.checked_add(LOCAL_PORT_STEP)
+                && TcpListener::bind((Ipv4Addr::LOCALHOST, next)).await.is_ok()
+            {
+                break l; // `next` is free (the probe listener dropped here)
             }
         };
         let preferred = busy.local_addr().unwrap().port();
