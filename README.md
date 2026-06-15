@@ -28,13 +28,14 @@ portmanager  myhost  connected  agent v0.1.0
 │▶ 8888   127.0.0.1:8888       node (5123)       host       private     user    │
 │  5432   10.88.0.5:5432       postgres (1847)   podman:web private     user    │
 └───────────────────────────────────────────────────────────────────────────────┘
- a add  d drop  v visibility  ↑/↓ select  q quit
+ a add  d drop  o open  v visibility  ↑/↓ select  q quit
 ```
 
-Keys: `a` add a forward (type any spec), `d` drop the selected one, `v` toggle
-its visibility (loopback ↔ exposed on `0.0.0.0`), `q` quit. "Running Process" is
-resolved on the remote (Linux remotes only). Piped/non-TTY invocations fall back
-to plain logging.
+Keys: `a` add a forward (type any spec), `d` drop the selected one, `o` open it
+in your web browser (`http://127.0.0.1:<port>`), `v` toggle its visibility
+(loopback ↔ exposed on `0.0.0.0`), `q` quit. "Running Process" is resolved on
+the remote (Linux remotes only). Piped/non-TTY invocations fall back to plain
+logging.
 
 Run the local client in the background (no TUI) with `-d`/`--daemon`:
 
@@ -161,8 +162,12 @@ local = "same"       # mirror remote port; fall back to a free one
   you. `portmanager doctor <host>` reports this proactively. Cloud security
   groups / network ACLs are separate and must be opened in your provider.
 - The agent's UDP listener is mutually authenticated, but it *is* a listening
-  port run with your remote user's privileges; the grace window
-  (`--grace-secs`, default 300) bounds how long it outlives a client.
+  port run with your remote user's privileges; the grace window bounds how long
+  it outlives a client. After the last client disconnects the agent waits this
+  long for a re-attach (roaming/sleep/outage) before self-reaping. The default
+  is **12 hours**; set it per-launch with `--agent-grace` (`30s`/`15m`/`12h`/`2d`,
+  a bare number is seconds — e.g. `--agent-grace 2d` to survive a weekend, or
+  `--agent-grace 5m` to reap quickly).
 - One client per session. The control socket prevents a second client for the
   same host on one machine; two separate launches get separate agent sessions.
   Sharing a single session across clients (by copying its secrets) is

@@ -73,12 +73,17 @@ impl Supervisor {
     /// connection is up (so callers can bind forwards immediately).
     ///
     /// `verbose` is the client's `-v` count, threaded to the remote agent.
-    pub async fn start(host: String, listen: Option<String>, verbose: u8) -> Result<Self> {
+    pub async fn start(
+        host: String,
+        listen: Option<String>,
+        verbose: u8,
+        grace_secs: u64,
+    ) -> Result<Self> {
         let timing = Timing::default();
 
         let (status_tx, status_rx) = watch::channel(Status::Bootstrapping);
         info!(%host, "bootstrapping agent over SSH");
-        let session = bootstrap_agent(&host, listen.as_deref(), verbose).await?;
+        let session = bootstrap_agent(&host, listen.as_deref(), verbose, grace_secs).await?;
         let addr = resolve(&session.quic_target).await?;
         let (version_tx, version_rx) = watch::channel(session.agent_version.clone());
 
@@ -120,6 +125,7 @@ impl Supervisor {
             host,
             listen,
             verbose,
+            grace_secs,
             endpoint,
             timing,
             session,
@@ -155,6 +161,8 @@ struct MonitorCtx {
     host: String,
     listen: Option<String>,
     verbose: u8,
+    /// Grace window (seconds) handed to the agent on every (re-)bootstrap.
+    grace_secs: u64,
     endpoint: Endpoint,
     timing: Timing,
     session: AgentSession,
@@ -239,7 +247,14 @@ async fn monitor_loop(mut ctx: MonitorCtx) {
             if attempt.is_multiple_of(REATTACH_ATTEMPTS_PER_CYCLE) {
                 ctx.status_tx.send_replace(Status::Bootstrapping);
                 info!("re-bootstrapping agent over SSH");
-                match bootstrap_agent(&ctx.host, ctx.listen.as_deref(), ctx.verbose).await {
+                match bootstrap_agent(
+                    &ctx.host,
+                    ctx.listen.as_deref(),
+                    ctx.verbose,
+                    ctx.grace_secs,
+                )
+                .await
+                {
                     Ok(session) => match resolve(&session.quic_target).await {
                         Ok(addr) => {
                             match crypto::client_config(
@@ -301,15 +316,20 @@ fn advise_port(listen: Option<&str>) -> AdvisePort {
         ))
 }
 
-async fn bootstrap_agent(host: &str, listen: Option<&str>, verbose: u8) -> Result<AgentSession> {
+async fn bootstrap_agent(
+    host: &str,
+    listen: Option<&str>,
+    verbose: u8,
+    grace_secs: u64,
+) -> Result<AgentSession> {
     if let Some(listen) = listen {
-        return bootstrap::bootstrap(host, listen, verbose).await;
+        return bootstrap::bootstrap(host, listen, verbose, grace_secs).await;
     }
 
     let mut last_err = None;
     for port in DEFAULT_UDP_PORT_START..=DEFAULT_UDP_PORT_END {
         let listen = format!("0.0.0.0:{port}");
-        match bootstrap::bootstrap(host, &listen, verbose).await {
+        match bootstrap::bootstrap(host, &listen, verbose, grace_secs).await {
             Ok(session) => return Ok(session),
             Err(e) => last_err = Some(e),
         }
