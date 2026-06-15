@@ -38,8 +38,8 @@ pub struct RunArgs {
     #[arg(short, long)]
     pub profile: Option<String>,
 
-    /// Start the local forwarding client in the background.
-    #[arg(long)]
+    /// Start the local forwarding client in the background (no TUI).
+    #[arg(short = 'd', long)]
     pub daemon: bool,
 
     /// UDP address the remote agent should bind. Defaults to the mosh-style

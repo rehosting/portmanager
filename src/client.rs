@@ -66,11 +66,35 @@ pub fn new_health_handle() -> HealthHandle {
     Arc::new(StdMutex::new(ForwardHealth::default()))
 }
 
+/// How a forward came to be — used by the TUI's "Origin" column. Runtime-only;
+/// not part of the spec and not persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// Added explicitly on the CLI or via `add`/the TUI.
+    UserAdded,
+    /// Restored from the host's remembered state or a named profile at launch.
+    Remembered,
+    /// Bound automatically by discovery against an auto-forward rule.
+    AutoForwarded,
+}
+
+impl Origin {
+    /// Short label for the TUI column.
+    pub fn label(self) -> &'static str {
+        match self {
+            Origin::UserAdded => "user",
+            Origin::Remembered => "remembered",
+            Origin::AutoForwarded => "auto",
+        }
+    }
+}
+
 /// Snapshot of one active forward for display (spec, bound addr, health).
 #[derive(Debug, Clone)]
 pub struct ForwardSnapshot {
     pub spec: ForwardSpec,
     pub local: SocketAddr,
+    pub origin: Origin,
     pub ok_connections: u64,
     pub last_error: Option<String>,
 }
@@ -129,6 +153,7 @@ pub async fn bind_forward(
 pub struct ActiveForward {
     pub spec: ForwardSpec,
     pub local: SocketAddr,
+    pub origin: Origin,
     health: HealthHandle,
     task: JoinHandle<()>,
 }
@@ -152,8 +177,9 @@ impl ForwardSet {
     /// Bind and start a forward. Returns the actual local address. Omitted
     /// local ports prefer the remote port; if it is unavailable they walk a
     /// human-friendly ladder (80 -> 1080 -> 2080 -> ...) and finally fall back
-    /// to a free ephemeral port if every rung is taken.
-    pub async fn add(&self, spec: ForwardSpec) -> Result<SocketAddr> {
+    /// to a free ephemeral port if every rung is taken. `origin` records where
+    /// the forward came from for display only.
+    pub async fn add(&self, spec: ForwardSpec, origin: Origin) -> Result<SocketAddr> {
         let mut active = self.active.lock().await;
         let mut bind_spec = spec.clone();
         let preferred_port = bind_spec.local_port;
@@ -211,6 +237,7 @@ impl ForwardSet {
             ActiveForward {
                 spec: bind_spec,
                 local,
+                origin,
                 health,
                 task,
             },
@@ -252,6 +279,7 @@ impl ForwardSet {
                 ForwardSnapshot {
                     spec: f.spec.clone(),
                     local: f.local,
+                    origin: f.origin,
                     ok_connections: h.ok_connections,
                     last_error: h.last_error.clone(),
                 }
@@ -418,7 +446,10 @@ mod tests {
         let (_slot_tx, slot_rx) = conn_slot(None);
         let forwards = ForwardSet::new(slot_rx);
 
-        let local = forwards.add(spec(preferred, true)).await.unwrap();
+        let local = forwards
+            .add(spec(preferred, true), Origin::UserAdded)
+            .await
+            .unwrap();
 
         assert_eq!(local.port(), preferred + LOCAL_PORT_STEP);
         forwards.remove(local.port()).await.unwrap();
@@ -431,7 +462,10 @@ mod tests {
         let (_slot_tx, slot_rx) = conn_slot(None);
         let forwards = ForwardSet::new(slot_rx);
 
-        let local = forwards.add(spec(preferred, true)).await.unwrap();
+        let local = forwards
+            .add(spec(preferred, true), Origin::UserAdded)
+            .await
+            .unwrap();
 
         assert_ne!(local.port(), preferred);
         let active = forwards.list().await;
@@ -447,8 +481,14 @@ mod tests {
         let forwards = ForwardSet::new(slot_rx);
 
         // Two distinct ephemeral forwards (port 0 -> free port each).
-        forwards.add(spec(0, false)).await.unwrap();
-        forwards.add(spec(0, false)).await.unwrap();
+        forwards
+            .add(spec(0, false), Origin::UserAdded)
+            .await
+            .unwrap();
+        forwards
+            .add(spec(0, false), Origin::UserAdded)
+            .await
+            .unwrap();
         assert_eq!(forwards.list().await.len(), 2);
 
         assert_eq!(forwards.clear().await, 2);
@@ -462,6 +502,11 @@ mod tests {
         let (_slot_tx, slot_rx) = conn_slot(None);
         let forwards = ForwardSet::new(slot_rx);
 
-        assert!(forwards.add(spec(preferred, false)).await.is_err());
+        assert!(
+            forwards
+                .add(spec(preferred, false), Origin::UserAdded)
+                .await
+                .is_err()
+        );
     }
 }
