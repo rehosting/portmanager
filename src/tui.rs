@@ -198,6 +198,7 @@ impl App {
             }
             KeyCode::Char('d') | KeyCode::Delete => self.drop_selected(forwards).await,
             KeyCode::Char('v') => self.toggle_visibility(forwards).await,
+            KeyCode::Char('o') | KeyCode::Enter => self.open_selected(),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             _ => {}
@@ -254,6 +255,19 @@ impl App {
             Ok(spec) => self.message = Some(format!("dropped {}", control::display_spec(&spec))),
             Err(e) => self.message = Some(format!("drop failed: {e:#}")),
         }
+    }
+
+    /// Open the selected forward's local endpoint in the default web browser
+    /// (VSCode's globe icon). We always dial loopback — even an exposed forward
+    /// is reachable there — and assume `http`, the common case for a forwarded
+    /// dev server.
+    fn open_selected(&mut self) {
+        let Some(snap) = self.selected() else { return };
+        let url = forward_url(snap.local.port());
+        self.message = Some(match open_in_browser(&url) {
+            Ok(()) => format!("opening {url}"),
+            Err(e) => format!("could not open browser: {e}"),
+        });
     }
 
     /// Rebind the selected forward with its local bind address flipped between
@@ -463,7 +477,7 @@ impl App {
                     ))
                 } else {
                     Line::from(Span::styled(
-                        "a add  d drop  v visibility  ↑/↓ select  q quit",
+                        "a add  d drop  o open  v visibility  ↑/↓ select  q quit",
                         Style::default().fg(Color::DarkGray),
                     ))
                 }
@@ -510,6 +524,46 @@ fn install_panic_hook() {
             original(info);
         }));
     });
+}
+
+// --- open in browser -----------------------------------------------------
+
+/// The local URL for a forward bound on `local_port`. Always loopback (reachable
+/// for both private and exposed forwards) and `http`, the common dev-server case.
+fn forward_url(local_port: u16) -> String {
+    format!("http://127.0.0.1:{local_port}")
+}
+
+/// Hand `url` to the platform's default-application opener, detached. Returns an
+/// error if the opener can't be spawned (e.g. headless host with no `xdg-open`).
+fn open_in_browser(url: &str) -> Result<()> {
+    use std::process::Stdio;
+
+    let mut cmd = browser_command(url);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("launching browser opener for {url}"))?;
+    Ok(())
+}
+
+/// Build the per-OS command that opens a URL in the default browser.
+fn browser_command(url: &str) -> std::process::Command {
+    let mut cmd;
+    if cfg!(target_os = "macos") {
+        cmd = std::process::Command::new("open");
+        cmd.arg(url);
+    } else if cfg!(target_os = "windows") {
+        // `start` is a cmd builtin; the empty title arg keeps a quoted URL from
+        // being treated as the window title.
+        cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "start", "", url]);
+    } else {
+        cmd = std::process::Command::new("xdg-open");
+        cmd.arg(url);
+    }
+    cmd
 }
 
 #[cfg(test)]
@@ -594,6 +648,21 @@ mod tests {
         assert!(
             text.contains("Press 'a' to add"),
             "empty hint missing: {text}"
+        );
+    }
+
+    #[test]
+    fn forward_url_is_loopback_http() {
+        assert_eq!(forward_url(8888), "http://127.0.0.1:8888");
+    }
+
+    #[test]
+    fn browser_command_targets_the_url() {
+        let cmd = browser_command("http://127.0.0.1:8888");
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy()).collect();
+        assert!(
+            args.iter().any(|a| a == "http://127.0.0.1:8888"),
+            "url should be passed to the opener: {args:?}"
         );
     }
 }
