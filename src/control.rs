@@ -291,8 +291,9 @@ async fn entries(ctx: &ControlCtx) -> Vec<ForwardEntry> {
         .collect()
 }
 
-/// Render one forward's live health for `list`/`status`.
-fn health_label(connected: bool, s: &crate::client::ForwardSnapshot) -> String {
+/// Render one forward's live health for `list`/`status` (and the TUI's Health
+/// column).
+pub fn health_label(connected: bool, s: &crate::client::ForwardSnapshot) -> String {
     if !connected {
         return "session reconnecting".to_string();
     }
@@ -306,7 +307,10 @@ fn health_label(connected: bool, s: &crate::client::ForwardSnapshot) -> String {
 
 async fn add_forward(spec: &str, ctx: &ControlCtx) -> Result<std::net::SocketAddr> {
     let parsed: ForwardSpec = spec.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let local = ctx.forwards.add(parsed).await?;
+    let local = ctx
+        .forwards
+        .add(parsed, crate::client::Origin::UserAdded)
+        .await?;
     persist(ctx).await;
     Ok(local)
 }
@@ -345,23 +349,38 @@ async fn persist(ctx: &ControlCtx) {
 
 /// Canonical CLI-grammar rendering of a spec (parseable back).
 pub fn display_spec(spec: &ForwardSpec) -> String {
+    use std::net::{IpAddr, Ipv4Addr};
+
     let ns = spec.ns.to_wire();
     let prefix = if ns.is_empty() {
         String::new()
     } else {
         format!("{ns}@")
     };
-    if spec.local_port_auto {
-        // Auto local port: persist the short (preferred) form regardless of the
-        // actually-bound port. Otherwise a fallback to an ephemeral port would
-        // be written as a strict `->NNNNN` and frozen on the next launch,
-        // instead of re-preferring the original port. The live bound port is
-        // still visible in `list`'s local column.
+    let loopback = spec.local_addr == IpAddr::V4(Ipv4Addr::LOCALHOST);
+    if spec.local_port_auto && loopback {
+        // Auto local port on the default loopback bind: persist the short
+        // (preferred) form regardless of the actually-bound port. Otherwise a
+        // fallback to an ephemeral port would be written as a strict `->NNNNN`
+        // and frozen on the next launch, instead of re-preferring the original
+        // port. The live bound port is still visible in `list`'s local column.
         return format!("{prefix}{}:{}", spec.remote_host, spec.remote_port);
     }
+    // A non-loopback bind (an "exposed" forward) forces the explicit form, even
+    // for an auto port: visibility must persist and the port is pinned across
+    // the rebind, so we render the concrete bind address and local port.
+    let local = if loopback {
+        spec.local_port.to_string()
+    } else {
+        let bind = match spec.local_addr {
+            IpAddr::V4(v4) => v4.to_string(),
+            IpAddr::V6(v6) => format!("[{v6}]"),
+        };
+        format!("{bind}:{}", spec.local_port)
+    };
     format!(
         "{prefix}{}:{}->{}",
-        spec.remote_host, spec.remote_port, spec.local_port
+        spec.remote_host, spec.remote_port, local
     )
 }
 
@@ -450,6 +469,8 @@ mod tests {
             "8888",
             "192.168.4.2:8080->8080",
             "podman:web@10.88.0.5:5432->15432",
+            "8080->0.0.0.0:8080",
+            "podman:web@10.88.0.5:5432->0.0.0.0:15432",
         ] {
             let spec: ForwardSpec = raw.parse().unwrap();
             let shown = display_spec(&spec);

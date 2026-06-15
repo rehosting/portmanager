@@ -15,10 +15,31 @@ INFO forward up local=127.0.0.1:5432 target=10.88.0.5:5432 ns=podman:web
 INFO session up — Ctrl-C to stop
 ```
 
-Run the local client in the background with `--daemon`:
+Launched on a terminal, the foreground client opens an **interactive TUI** — a
+VSCode-style table of forwards (Port · Forwarded Address · Running Process ·
+Namespace · Visibility · Origin · Health) with a session-state header and a log
+pane. You don't need to pass any specs: start `portmanager myhost` and add them
+live.
+
+```text
+portmanager  myhost  connected  agent v0.1.0
+┌ forwards (2) ───────────────────────────────────────────────────────────────┐
+│ Port    Forwarded Address    Running Process   Namespace  Visibility  Origin  │
+│▶ 8888   127.0.0.1:8888       node (5123)       host       private     user    │
+│  5432   10.88.0.5:5432       postgres (1847)   podman:web private     user    │
+└───────────────────────────────────────────────────────────────────────────────┘
+ a add  d drop  v visibility  ↑/↓ select  q quit
+```
+
+Keys: `a` add a forward (type any spec), `d` drop the selected one, `v` toggle
+its visibility (loopback ↔ exposed on `0.0.0.0`), `q` quit. "Running Process" is
+resolved on the remote (Linux remotes only). Piped/non-TTY invocations fall back
+to plain logging.
+
+Run the local client in the background (no TUI) with `-d`/`--daemon`:
 
 ```console
-$ portmanager --daemon myhost 8888 db.internal:5432
+$ portmanager -d myhost 8888 db.internal:5432
 $ portmanager status myhost
 $ portmanager stop myhost
 ```
@@ -50,11 +71,12 @@ $ portmanager stop myhost
 ### Forward spec grammar
 
 ```
-[NS@][HOST:]PORT[->LOCALPORT]
+[NS@][HOST:]PORT[->[BINDADDR:]LOCALPORT]
 
 8888                          # remote 127.0.0.1:8888 -> local 8888, or a free port if busy
 192.168.4.2:8080              # remote 192.168.4.2:8080 -> local 8080, or a free port if busy
 192.168.4.2:8080->8080        # a host on the remote's network
+8080->0.0.0.0:8080            # expose the forward on the LAN, not just loopback
 podman:web@10.88.0.5:5432->5432   # inside a rootless container's netns
 pid:1234@8080                 # inside any process's netns (yours)
 nspath:/run/user/1000/netns/x@80  # explicit namespace file
@@ -62,7 +84,10 @@ nspath:/run/user/1000/netns/x@80  # explicit namespace file
 
 If `->LOCALPORT` is omitted, portmanager prefers the same local port and falls
 back to an available ephemeral port. If `->LOCALPORT` is present, that local
-port is strict and binding fails if it is unavailable.
+port is strict and binding fails if it is unavailable. An optional `BINDADDR:`
+before the local port sets the listener's bind address — loopback by default
+(private), or `0.0.0.0` to expose the forward on the LAN. The TUI's `v` key
+toggles this on a live forward.
 
 Namespace dialing enters rootless namespaces (userns+netns, the
 `podman unshare` trick) via a resident per-namespace helper that hands
