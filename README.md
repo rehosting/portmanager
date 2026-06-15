@@ -162,8 +162,12 @@ local = "same"       # mirror remote port; fall back to a free one
   you. `portmanager doctor <host>` reports this proactively. Cloud security
   groups / network ACLs are separate and must be opened in your provider.
 - The agent's UDP listener is mutually authenticated, but it *is* a listening
-  port run with your remote user's privileges; the grace window
-  (`--grace-secs`, default 300) bounds how long it outlives a client.
+  port run with your remote user's privileges; the grace window bounds how long
+  it outlives a client. After the last client disconnects the agent waits this
+  long for a re-attach (roaming/sleep/outage) before self-reaping. The default
+  is **12 hours**; set it per-launch with `--agent-grace` (`30s`/`15m`/`12h`/`2d`,
+  a bare number is seconds — e.g. `--agent-grace 2d` to survive a weekend, or
+  `--agent-grace 5m` to reap quickly).
 - One client per session. The control socket prevents a second client for the
   same host on one machine; two separate launches get separate agent sessions.
   Sharing a single session across clients (by copying its secrets) is
