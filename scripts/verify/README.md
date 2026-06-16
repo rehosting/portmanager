@@ -23,6 +23,7 @@ with `python3` available remotely.
 | `forward_netns.sh` | forward into a rootless network namespace via `pid:<pid>@…` (skips if unprivileged userns is unavailable) |
 | `health.sh` | a forward to a dead target surfaces a `last error` in `list`/`status` instead of silently doing nothing |
 | `clear_forget.sh` | `clear` drops every forward live; `forget` deletes persisted host state |
+| `via_ssh.sh` | the `--via-ssh` SSH-tunnel transport carries content (data plane over `ssh -L`, not QUIC); confirms the tunnel path was taken and the choice persisted; forwards into a namespace over the tunnel (`podman:`/`pid:`, if rootless ns work); and exercises **recovery** (kill the `ssh -L` tunnel → forwarding resumes), **concurrency** (8 simultaneous fetches), and **graceful shutdown** (`pm stop` exits the agent) |
 
 Each scenario is self-contained: it starts and stops its own session and remote
 listeners (cleanup runs on exit). `run-all.sh` reports PASS/FAIL/SKIP per

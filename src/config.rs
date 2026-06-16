@@ -68,6 +68,10 @@ pub struct HostState {
     /// Auto-forward rules (opt-in; empty = discovery only reports, never binds).
     #[serde(default)]
     pub autoforward: Vec<AutoForwardRule>,
+    /// Carry the data plane over SSH (`--via-ssh`). Remembered so a plain
+    /// relaunch keeps using the tunnel transport.
+    #[serde(default)]
+    pub via_ssh: bool,
 }
 
 impl HostState {
@@ -97,6 +101,9 @@ pub struct Profile {
     /// Auto-forward rules for this profile.
     #[serde(default)]
     pub autoforward: Vec<AutoForwardRule>,
+    /// Carry the data plane over SSH (`--via-ssh`) for this profile.
+    #[serde(default)]
+    pub via_ssh: bool,
 }
 
 /// Top-level `config.toml`.
@@ -209,6 +216,17 @@ pub fn forget_state(host: &str) -> Result<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
     }
+}
+
+/// Remember that `host` should use the SSH-tunnel transport, so a later plain
+/// `portmanager <host>` launch keeps using it. Best-effort.
+pub fn remember_via_ssh(host: &str) -> Result<()> {
+    let mut state = load_state(host)?;
+    if !state.via_ssh {
+        state.via_ssh = true;
+        save_state(host, &state)?;
+    }
+    Ok(())
 }
 
 /// Make a host string filesystem-safe.

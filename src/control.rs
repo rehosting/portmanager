@@ -384,6 +384,40 @@ pub fn display_spec(spec: &ForwardSpec) -> String {
     )
 }
 
+/// Whether a live session already owns the control socket for `host` (something
+/// answers a connect). Used to fast-fail a second launch *before* bootstrapping
+/// a redundant agent. A socket file that no one is listening on (a crashed
+/// session) reads as not-live — `serve` cleans it up on bind.
+#[cfg(unix)]
+pub async fn session_is_live(host: &str) -> bool {
+    let Ok(path) = socket_path(host) else {
+        return false;
+    };
+    path.exists() && UnixStream::connect(&path).await.is_ok()
+}
+
+/// No Unix-socket control on this platform, so no liveness probe either.
+#[cfg(not(unix))]
+pub async fn session_is_live(_host: &str) -> bool {
+    false
+}
+
+/// Blocking variant of [`session_is_live`], for the pre-fork daemon launcher
+/// (which runs before any tokio runtime exists).
+#[cfg(unix)]
+pub fn session_is_live_blocking(host: &str) -> bool {
+    use std::os::unix::net::UnixStream;
+    let Ok(path) = socket_path(host) else {
+        return false;
+    };
+    path.exists() && UnixStream::connect(&path).is_ok()
+}
+
+#[cfg(not(unix))]
+pub fn session_is_live_blocking(_host: &str) -> bool {
+    false
+}
+
 /// Client side: send one request to the session for `host`.
 #[cfg(unix)]
 pub async fn request(host: &str, req: &Request) -> Result<Response> {
@@ -429,6 +463,27 @@ pub fn cleanup(_host: &str) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn session_liveness_probe() {
+        use std::os::unix::net::UnixListener;
+
+        let host = format!("pm-probe-{}", std::process::id());
+        // Nothing bound yet -> not live.
+        assert!(!session_is_live_blocking(&host));
+
+        // A live listener on the per-host socket reads as live.
+        let path = socket_path(&host).unwrap();
+        let _ = std::fs::remove_file(&path); // clear any stale file from a prior run
+        let listener = UnixListener::bind(&path).unwrap();
+        assert!(session_is_live_blocking(&host));
+
+        // Once the listener is gone, the lingering socket file is not "live".
+        drop(listener);
+        assert!(!session_is_live_blocking(&host));
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn request_response_json_roundtrip() {
