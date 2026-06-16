@@ -391,6 +391,29 @@ async fn run_epoch(
     }
 }
 
+/// Build the default forward spec for a discovered listener: dial it inside its
+/// own namespace (loopback when the listener is bound to a wildcard address) and
+/// prefer its own port locally with human-friendly fallback. Shared by the
+/// interactive TUI picker and the auto-forward path so both derive the target
+/// identically.
+pub fn spec_for_listener(l: &Listener) -> Result<ForwardSpec> {
+    // Dial loopback inside the namespace for wildcard binds.
+    let remote_host = match l.ip.as_str() {
+        "0.0.0.0" | "::" => "127.0.0.1".to_string(),
+        ip => ip.to_string(),
+    };
+    let ns = NsSpec::from_wire(&l.ns).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(ForwardSpec {
+        ns,
+        remote_host,
+        remote_port: l.port,
+        local_addr: std::net::Ipv4Addr::LOCALHOST.into(),
+        local_port: l.port,
+        local_port_auto: true,
+        kind: crate::forward::ForwardKind::Direct,
+    })
+}
+
 /// Auto-bind one discovered listener if a rule matches and it isn't already
 /// forwarded. Stable assignments: a remote port keeps its local port across
 /// sessions; collisions fall back to an ephemeral port, then persist.
@@ -407,12 +430,6 @@ async fn consider(
         return Ok(()); // already forwarded (manually or by a previous snapshot)
     }
 
-    // Dial loopback inside the namespace for wildcard binds.
-    let remote_host = match l.ip.as_str() {
-        "0.0.0.0" | "::" => "127.0.0.1".to_string(),
-        ip => ip.to_string(),
-    };
-
     let key = HostState::assignment_key(&l.ns, l.port);
     let state = {
         let host = host.to_string();
@@ -427,15 +444,11 @@ async fn consider(
             _ => None,
         });
 
-    let ns = NsSpec::from_wire(&l.ns).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut spec = ForwardSpec {
-        ns,
-        remote_host,
-        remote_port: l.port,
-        local_addr: std::net::Ipv4Addr::LOCALHOST.into(),
-        local_port: preferred.unwrap_or(0),
-        local_port_auto: false,
-    };
+    // Same target derivation as the TUI picker; auto-forward then pins the local
+    // port to the remembered assignment (no ladder) so it stays stable.
+    let mut spec = spec_for_listener(l)?;
+    spec.local_port = preferred.unwrap_or(0);
+    spec.local_port_auto = false;
 
     // Preferred port may collide; fall back to ephemeral.
     use crate::client::Origin;

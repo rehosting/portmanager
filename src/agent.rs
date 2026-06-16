@@ -534,6 +534,12 @@ where
             .with_context(|| format!("connecting to {target} in {}", header.ns))?
     };
 
-    proto::splice(tcp, send, recv).await.context("splicing")?;
+    // The agent doesn't surface per-forward throughput (that's a client-side
+    // concern), so it counts into throwaway tallies.
+    use std::sync::atomic::AtomicU64;
+    let (up, down) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    proto::splice(tcp, send, recv, up, down)
+        .await
+        .context("splicing")?;
     Ok(())
 }

@@ -17,25 +17,29 @@ INFO session up — Ctrl-C to stop
 
 Launched on a terminal, the foreground client opens an **interactive TUI** — a
 VSCode-style table of forwards (Port · Forwarded Address · Running Process ·
-Namespace · Visibility · Origin · Health) with a session-state header and a log
-pane. You don't need to pass any specs: start `portmanager myhost` and add them
-live.
+Namespace · Visibility · Origin · Rate · Health) with a session-state header and
+a log pane. You don't need to pass any specs: start `portmanager myhost` and add
+them live.
 
 ```text
 portmanager  myhost  connected  agent v0.1.0
-┌ forwards (2) ───────────────────────────────────────────────────────────────┐
-│ Port    Forwarded Address    Running Process   Namespace  Visibility  Origin  │
-│▶ 8888   127.0.0.1:8888       node (5123)       host       private     user    │
-│  5432   10.88.0.5:5432       postgres (1847)   podman:web private     user    │
-└───────────────────────────────────────────────────────────────────────────────┘
- a add  d drop  o open  v visibility  ↑/↓ select  q quit
+┌ forwards (2) ───────────────────────────────────────────────────────────────────────┐
+│ Port    Forwarded Address    Running Process   Namespace  Visibility  Origin  Rate    │
+│▶ 8888   127.0.0.1:8888       node (5123)       host       private     user    1.2 MiB/s│
+│  5432   10.88.0.5:5432       postgres (1847)   podman:web private     user    idle     │
+└───────────────────────────────────────────────────────────────────────────────────────┘
+ a add  d drop  o open  y copy  i detail  v vis  f find  / filter  ? help  q quit
 ```
 
-Keys: `a` add a forward (type any spec), `d` drop the selected one, `o` open it
-in your web browser (`http://127.0.0.1:<port>`), `v` toggle its visibility
-(loopback ↔ exposed on `0.0.0.0`), `q` quit. "Running Process" is resolved on
-the remote (Linux remotes only). Piped/non-TTY invocations fall back to plain
-logging.
+Keys: `a` add a forward (type any spec), `d` drop the selected one (with a `y/n`
+confirm), `o` open it in your web browser (`http://127.0.0.1:<port>`), `y` copy
+its URL to the clipboard, `i` inspect it (full health, byte counts, and a live
+throughput sparkline), `v` toggle its visibility (loopback ↔ exposed on
+`0.0.0.0`), `f` open the **discovered-ports picker** to forward a port the agent
+sees but you haven't forwarded yet, `/` filter the table, `PgUp`/`PgDn` scroll
+the log, `?` show all keys, `q` quit. The "Rate" column and detail sparkline show
+live throughput. "Running Process" is resolved on the remote (Linux remotes
+only). Piped/non-TTY invocations fall back to plain logging.
 
 Run the local client in the background (no TUI) with `-d`/`--daemon`:
 
@@ -99,6 +103,7 @@ TUI, the control socket) work unchanged.
 
 ```
 [NS@][HOST:]PORT[->[BINDADDR:]LOCALPORT]
+[NS@]socks[->LOCALPORT]
 
 8888                          # remote 127.0.0.1:8888 -> local 8888, or a free port if busy
 192.168.4.2:8080              # remote 192.168.4.2:8080 -> local 8080, or a free port if busy
@@ -107,6 +112,9 @@ TUI, the control socket) work unchanged.
 podman:web@10.88.0.5:5432->5432   # inside a rootless container's netns
 pid:1234@8080                 # inside any process's netns (yours)
 nspath:/run/user/1000/netns/x@80  # explicit namespace file
+socks                         # a SOCKS5 proxy on local 1080 -> the remote's whole network
+socks->9050                   # ...on a specific local port
+podman:web@socks->1080        # ...whose targets are dialed from inside a container's netns
 ```
 
 If `->LOCALPORT` is omitted, portmanager prefers the same local port and falls
@@ -115,6 +123,17 @@ port is strict and binding fails if it is unavailable. An optional `BINDADDR:`
 before the local port sets the listener's bind address — loopback by default
 (private), or `0.0.0.0` to expose the forward on the LAN. The TUI's `v` key
 toggles this on a live forward.
+
+### SOCKS5 dynamic proxy
+
+`socks` binds a local SOCKS5 proxy instead of a fixed-target forward — the
+`ssh -D` equivalent. Point a browser, `proxychains`, or `curl --socks5-hostname
+localhost:1080 …` at it and every connection is dialed by the agent on the
+remote, so you reach the remote's entire network from one port. Hostnames
+resolve **on the remote** (remote DNS), so internal names that only resolve over
+there just work. Prefixing a namespace (`podman:web@socks->1080`) dials every
+proxied connection from *inside* that container's network view. SOCKS proxies
+are loopback-only (no LAN exposure) and support no-auth CONNECT.
 
 Namespace dialing enters rootless namespaces (userns+netns, the
 `podman unshare` trick) via a resident per-namespace helper that hands

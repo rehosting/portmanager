@@ -357,6 +357,17 @@ pub fn display_spec(spec: &ForwardSpec) -> String {
     } else {
         format!("{ns}@")
     };
+    // A SOCKS proxy has no remote target. Mirror the direct-forward auto-port
+    // rule: an auto local port persists as the short `socks` form (re-preferring
+    // 1080 next launch rather than freezing a fallback port); a pinned port
+    // persists explicitly. Loopback is implied and enforced by the parser.
+    if spec.is_socks() {
+        return if spec.local_port_auto {
+            format!("{prefix}socks")
+        } else {
+            format!("{prefix}socks->{}", spec.local_port)
+        };
+    }
     let loopback = spec.local_addr == IpAddr::V4(Ipv4Addr::LOCALHOST);
     if spec.local_port_auto && loopback {
         // Auto local port on the default loopback bind: persist the short
@@ -526,6 +537,9 @@ mod tests {
             "podman:web@10.88.0.5:5432->15432",
             "8080->0.0.0.0:8080",
             "podman:web@10.88.0.5:5432->0.0.0.0:15432",
+            "socks",
+            "socks->1080",
+            "podman:web@socks->9050",
         ] {
             let spec: ForwardSpec = raw.parse().unwrap();
             let shown = display_spec(&spec);
@@ -548,6 +562,7 @@ mod tests {
             local_addr: std::net::Ipv4Addr::LOCALHOST.into(),
             local_port: 45000,
             local_port_auto: true,
+            kind: Default::default(),
         };
         // Persisted form must be the short (preferred) form, not `->45000`.
         let shown = display_spec(&spec);

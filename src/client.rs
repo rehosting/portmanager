@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
@@ -23,6 +24,7 @@ use crate::conn::Conn;
 use crate::error;
 use crate::forward::ForwardSpec;
 use crate::proto::{self, StreamHeader};
+use crate::socks;
 
 /// Default seconds an accepted local connection waits for a live agent
 /// connection (e.g. mid-reconnect) before being dropped.
@@ -56,6 +58,12 @@ pub struct ForwardHealth {
     pub ok_connections: u64,
     /// Most recent connection failure (full cause chain), if any.
     pub last_error: Option<String>,
+    /// Cumulative bytes sent client->agent across this forward's lifetime. Bumped
+    /// live by the splice; sampled by the TUI to derive a throughput rate. Shared
+    /// (`Arc`) so the splice task can count without holding the health mutex.
+    pub bytes_up: Arc<AtomicU64>,
+    /// Cumulative bytes received agent->client across this forward's lifetime.
+    pub bytes_down: Arc<AtomicU64>,
 }
 
 /// Shared, cheaply-clonable handle to one forward's [`ForwardHealth`].
@@ -97,6 +105,10 @@ pub struct ForwardSnapshot {
     pub origin: Origin,
     pub ok_connections: u64,
     pub last_error: Option<String>,
+    /// Cumulative bytes client->agent at snapshot time.
+    pub bytes_up: u64,
+    /// Cumulative bytes agent->client at snapshot time.
+    pub bytes_down: u64,
 }
 
 /// Create a connection slot pair.
@@ -282,6 +294,8 @@ impl ForwardSet {
                     origin: f.origin,
                     ok_connections: h.ok_connections,
                     last_error: h.last_error.clone(),
+                    bytes_up: h.bytes_up.load(Ordering::Relaxed),
+                    bytes_down: h.bytes_down.load(Ordering::Relaxed),
                 }
             })
             .collect();
@@ -313,10 +327,16 @@ async fn accept_loop(
                 let slot = slot.clone();
                 let forward = forward.clone();
                 let health = health.clone();
+                // Clone the shared byte counters out of the health handle so the
+                // splice can tally without holding the health mutex.
+                let (bytes_up, bytes_down) = {
+                    let h = health.lock().unwrap();
+                    (h.bytes_up.clone(), h.bytes_down.clone())
+                };
                 let target = format!("{}:{}", forward.remote_host, forward.remote_port);
                 let ns = forward.ns.to_wire();
                 tokio::spawn(async move {
-                    match serve_one(slot, forward, tcp).await {
+                    match serve_one(slot, forward, tcp, bytes_up, bytes_down).await {
                         Ok(()) => {
                             health.lock().unwrap().ok_connections += 1;
                         }
@@ -349,11 +369,32 @@ async fn accept_loop(
 /// mid-reconnect, wait up to [`attach_deadline`] for a live connection; if a
 /// stale connection fails at open, wait for a replacement within the same
 /// deadline rather than failing immediately.
-async fn serve_one(mut slot: ConnSlot, forward: ForwardSpec, tcp: TcpStream) -> Result<()> {
-    let header = StreamHeader {
-        ns: forward.ns.to_wire(),
-        host: forward.remote_host.clone(),
-        port: forward.remote_port,
+async fn serve_one(
+    mut slot: ConnSlot,
+    forward: ForwardSpec,
+    mut tcp: TcpStream,
+    bytes_up: Arc<AtomicU64>,
+    bytes_down: Arc<AtomicU64>,
+) -> Result<()> {
+    // The target is fixed for a direct forward, but for a SOCKS proxy it comes
+    // from the client's per-connection handshake (which also lets the agent
+    // resolve DNS remotely). The namespace still rides along either way.
+    let is_socks = forward.is_socks();
+    let header = if is_socks {
+        let (host, port) = socks::negotiate(&mut tcp)
+            .await
+            .context("socks negotiation")?;
+        StreamHeader {
+            ns: forward.ns.to_wire(),
+            host,
+            port,
+        }
+    } else {
+        StreamHeader {
+            ns: forward.ns.to_wire(),
+            host: forward.remote_host.clone(),
+            port: forward.remote_port,
+        }
     };
 
     let deadline = tokio::time::Instant::now() + attach_deadline();
@@ -365,7 +406,12 @@ async fn serve_one(mut slot: ConnSlot, forward: ForwardSpec, tcp: TcpStream) -> 
             }
             let timeout = tokio::time::sleep_until(deadline);
             tokio::select! {
-                _ = timeout => anyhow::bail!("no agent connection within attach deadline"),
+                _ = timeout => {
+                    if is_socks {
+                        let _ = socks::reply(&mut tcp, socks::rep::GENERAL_FAILURE).await;
+                    }
+                    anyhow::bail!("no agent connection within attach deadline");
+                }
                 changed = slot.changed() => {
                     changed.context("session ended")?;
                 }
@@ -380,13 +426,29 @@ async fn serve_one(mut slot: ConnSlot, forward: ForwardSpec, tcp: TcpStream) -> 
                     .write(&mut send)
                     .await
                     .context("writing stream header")?;
-                return proto::splice(tcp, send, recv).await.context("splicing");
+                // For SOCKS, acknowledge success only once the upstream stream is
+                // open (so an unreachable agent surfaces as a failure reply). The
+                // agent dials lazily, so a failed *remote* dial just closes the
+                // stream — standard `ssh -D`-style best-effort connect semantics.
+                if is_socks {
+                    socks::reply(&mut tcp, socks::rep::SUCCESS)
+                        .await
+                        .context("socks success reply")?;
+                }
+                return proto::splice(tcp, send, recv, bytes_up, bytes_down)
+                    .await
+                    .context("splicing");
             }
             Err(e) => {
                 debug!(error = %e, "open_bi on stale connection; waiting for reconnect");
                 let timeout = tokio::time::sleep_until(deadline);
                 tokio::select! {
-                    _ = timeout => anyhow::bail!("agent connection lost and not re-established in time"),
+                    _ = timeout => {
+                        if is_socks {
+                            let _ = socks::reply(&mut tcp, socks::rep::GENERAL_FAILURE).await;
+                        }
+                        anyhow::bail!("agent connection lost and not re-established in time");
+                    }
                     changed = slot.changed() => {
                         changed.context("session ended")?;
                     }
@@ -413,6 +475,7 @@ mod tests {
             local_addr: Ipv4Addr::LOCALHOST.into(),
             local_port,
             local_port_auto,
+            kind: Default::default(),
         }
     }
 

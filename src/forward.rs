@@ -104,14 +104,26 @@ impl NsSpec {
     }
 }
 
+/// Whether a forward dials a fixed target or proxies dynamically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ForwardKind {
+    /// Dial the spec's `remote_host:remote_port` for every connection.
+    #[default]
+    Direct,
+    /// A local SOCKS5 proxy: the target is taken from each connection's SOCKS
+    /// handshake, so `remote_host`/`remote_port` are unused. Loopback-only.
+    Socks,
+}
+
 /// One fully-parsed port forward.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardSpec {
     /// Namespace the agent dials from.
     pub ns: NsSpec,
-    /// Remote host the agent connects to (resolved inside `ns`).
+    /// Remote host the agent connects to (resolved inside `ns`). Unused for
+    /// [`ForwardKind::Socks`].
     pub remote_host: String,
-    /// Remote port the agent connects to.
+    /// Remote port the agent connects to. Unused for [`ForwardKind::Socks`].
     pub remote_port: u16,
     /// Local address the client binds its listener on. Defaults to loopback.
     pub local_addr: IpAddr,
@@ -119,6 +131,8 @@ pub struct ForwardSpec {
     pub local_port: u16,
     /// Whether the local port was omitted and may fall back if unavailable.
     pub local_port_auto: bool,
+    /// Direct target dial vs. dynamic SOCKS5 proxy.
+    pub kind: ForwardKind,
 }
 
 impl ForwardSpec {
@@ -126,6 +140,15 @@ impl ForwardSpec {
     const DEFAULT_LOCAL_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
     /// Default remote host when a bare port is given.
     const DEFAULT_REMOTE_HOST: &'static str = "127.0.0.1";
+    /// Default local port for a bare `socks` spec (the conventional SOCKS port).
+    const SOCKS_DEFAULT_PORT: u16 = 1080;
+    /// Grammar token that requests a dynamic SOCKS5 proxy in place of a target.
+    const SOCKS_TOKEN: &'static str = "socks";
+
+    /// Whether this is a dynamic SOCKS5 proxy rather than a fixed-target forward.
+    pub fn is_socks(&self) -> bool {
+        matches!(self.kind, ForwardKind::Socks)
+    }
 
     /// A stable key identifying this forward by its local listen endpoint.
     ///
@@ -157,6 +180,34 @@ impl FromStr for ForwardSpec {
             None => (target.trim(), None),
         };
 
+        // `socks` in the target position requests a dynamic SOCKS5 proxy: there
+        // is no fixed remote target (it comes from each connection's handshake),
+        // and it is loopback-only.
+        if remote_part.eq_ignore_ascii_case(Self::SOCKS_TOKEN) {
+            let (local_addr, local_port, local_port_auto) = match local_part {
+                Some(l) => {
+                    let (addr, port) = parse_bind_port(l, raw)?;
+                    (addr, port, false)
+                }
+                None => (Self::DEFAULT_LOCAL_ADDR, Self::SOCKS_DEFAULT_PORT, true),
+            };
+            if !local_addr.is_loopback() {
+                return Err(SpecError::Malformed(
+                    raw.to_string(),
+                    "a SOCKS proxy is loopback-only; drop the bind address".into(),
+                ));
+            }
+            return Ok(ForwardSpec {
+                ns,
+                remote_host: String::new(),
+                remote_port: 0,
+                local_addr,
+                local_port,
+                local_port_auto,
+                kind: ForwardKind::Socks,
+            });
+        }
+
         let (remote_host, remote_port) = parse_host_port(remote_part, raw)?;
 
         let (local_addr, local_port) = match local_part {
@@ -171,6 +222,7 @@ impl FromStr for ForwardSpec {
             local_addr,
             local_port,
             local_port_auto: local_part.is_none(),
+            kind: ForwardKind::Direct,
         })
     }
 }
@@ -391,6 +443,51 @@ mod tests {
             parse("nspath:/proc/9/ns/net@80").ns,
             NsSpec::NsPath(PathBuf::from("/proc/9/ns/net"))
         );
+    }
+
+    #[test]
+    fn socks_default_port_is_auto_loopback() {
+        let f = parse("socks");
+        assert_eq!(f.kind, ForwardKind::Socks);
+        assert!(f.is_socks());
+        assert_eq!(f.ns, NsSpec::Host);
+        assert_eq!(f.local_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(f.local_port, 1080);
+        assert!(
+            f.local_port_auto,
+            "bare socks should fall back if 1080 is taken"
+        );
+    }
+
+    #[test]
+    fn socks_explicit_port_is_pinned() {
+        let f = parse("socks->9050");
+        assert_eq!(f.kind, ForwardKind::Socks);
+        assert_eq!(f.local_port, 9050);
+        assert!(!f.local_port_auto);
+    }
+
+    #[test]
+    fn socks_carries_namespace() {
+        let f = parse("podman:web@socks->9050");
+        assert_eq!(f.kind, ForwardKind::Socks);
+        assert_eq!(f.ns, NsSpec::Podman("web".into()));
+        assert_eq!(f.local_port, 9050);
+    }
+
+    #[test]
+    fn socks_rejects_non_loopback_bind() {
+        assert!(matches!(
+            "socks->0.0.0.0:1080".parse::<ForwardSpec>(),
+            Err(SpecError::Malformed(..))
+        ));
+    }
+
+    #[test]
+    fn socks_allows_ipv6_loopback() {
+        let f = parse("socks->[::1]:1080");
+        assert_eq!(f.kind, ForwardKind::Socks);
+        assert_eq!(f.local_addr, "::1".parse::<IpAddr>().unwrap());
     }
 
     #[test]

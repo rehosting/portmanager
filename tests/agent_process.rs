@@ -85,6 +85,7 @@ async fn agent_binary_bootstraps_and_forwards() {
         local_addr: Ipv4Addr::LOCALHOST.into(),
         local_port: 0,
         local_port_auto: false,
+        kind: Default::default(),
     };
     let (local_addr, _task) = client::bind_forward(slot_rx, forward, client::new_health_handle())
         .await
