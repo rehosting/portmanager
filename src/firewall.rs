@@ -147,6 +147,30 @@ pub async fn diagnose(host: &str, port: AdvisePort) -> String {
     }
 }
 
+/// A complete, user-facing message for a blocked-inbound-UDP failure: states the
+/// problem, then lays out the three ways forward as numbered options so the user
+/// can decide. Probes the remote firewall for option 1's exact command.
+pub async fn udp_failure_message(host: &str, port: AdvisePort) -> String {
+    options_message(host, port, &diagnose(host, port).await)
+}
+
+/// Pure formatter for [`udp_failure_message`]: composes the numbered options
+/// around an already-rendered firewall advisory (`fw_body`).
+fn options_message(host: &str, port: AdvisePort, fw_body: &str) -> String {
+    let fw_indented = fw_body.replace('\n', "\n        ");
+    format!(
+        "could not reach the agent's {} listener — the default transport (QUIC) needs \
+         inbound UDP, which appears to be blocked. You have three options:\n\n  \
+         1. Open inbound UDP on the remote (then just retry):\n        {fw_indented}\n\n  \
+         2. Pin one specific allowed UDP port and retry:\n        \
+         portmanager --remote-udp 0.0.0.0:<PORT> {host} ...\n\n  \
+         3. Don't use UDP at all — tunnel the data plane over SSH (no inbound UDP\n     \
+         needed; works through a jump host / bastion):\n        \
+         portmanager --via-ssh {host} ...",
+        port.human(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +201,17 @@ mod tests {
             advisory(Some(Firewall::Nftables), &AdvisePort::Single(53))
                 .contains("udp dport 53 accept")
         );
+    }
+
+    #[test]
+    fn options_message_lists_all_three_choices() {
+        let body = advisory(Some(Firewall::Ufw), &AdvisePort::Range(60000, 61000));
+        let msg = options_message("myhost", AdvisePort::Range(60000, 61000), &body);
+        // Problem statement + each numbered option with its concrete command.
+        assert!(msg.contains("inbound UDP"));
+        assert!(msg.contains("1.") && msg.contains("sudo ufw allow 60000:61000/udp"));
+        assert!(msg.contains("2.") && msg.contains("--remote-udp 0.0.0.0:<PORT> myhost"));
+        assert!(msg.contains("3.") && msg.contains("--via-ssh myhost"));
     }
 
     #[test]

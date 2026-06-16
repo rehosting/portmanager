@@ -73,6 +73,19 @@ macro_rules! hex_newtype {
 hex_newtype!(Token, 32);
 hex_newtype!(SessionId, 16);
 
+impl Token {
+    /// The raw 32 secret bytes, written first on each SSH-tunnel connection to
+    /// authorize it (the agent compares them constant-time).
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Reconstruct a token from raw bytes (the agent's read side of the gate).
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Token(bytes)
+    }
+}
+
 /// Client -> agent: client identity + session secret.
 #[derive(Debug, Clone)]
 pub struct Hello {
@@ -259,6 +272,16 @@ mod tests {
         assert_eq!(got.udp_port, 51820);
         assert_eq!(got.version, "0.1.0");
         assert!(got.session_id.ct_eq(&ready.session_id));
+    }
+
+    #[test]
+    fn token_bytes_roundtrip_and_match() {
+        let t = Token::random().unwrap();
+        let back = Token::from_bytes(*t.as_bytes());
+        assert!(t.ct_eq(&back));
+        // A different token must not match.
+        let other = Token::random().unwrap();
+        assert!(!t.ct_eq(&other));
     }
 
     #[tokio::test]

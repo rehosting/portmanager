@@ -14,13 +14,14 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use quinn::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::client::{ConnSlot, ForwardSet};
+use crate::client::ForwardSet;
+use crate::conn::Conn;
+use crate::client::ConnSlot;
 use crate::config::{self, AutoForwardRule, HostState};
 use crate::forward::{ForwardSpec, NsSpec};
 #[cfg(target_os = "linux")]
@@ -58,7 +59,11 @@ pub struct ListenerProc {
 
 /// Serve one discovery stream: read the watch list, then push snapshots until
 /// the stream closes.
-pub async fn serve(mut send: SendStream, recv: RecvStream) -> Result<()> {
+pub async fn serve<W, R>(mut send: W, recv: R) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
     let mut reader = BufReader::new(recv);
     let mut line = String::new();
     reader
@@ -326,7 +331,7 @@ async fn active_namespaces(
 /// the watched namespace set changes.
 async fn run_epoch(
     host: &str,
-    conn: &quinn::Connection,
+    conn: &Conn,
     watch_list: &str,
     forwards: &Arc<ForwardSet>,
     rules: &[AutoForwardRule],

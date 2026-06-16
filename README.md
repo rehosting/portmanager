@@ -69,6 +69,32 @@ $ portmanager stop myhost
 4. Each forwarded TCP connection is one QUIC stream; everything multiplexes
    over a single connection.
 
+### SSH-tunnel transport (`--via-ssh`)
+
+The QUIC data channel dials the agent's UDP port **directly** — which needs a
+UDP path from client to agent. For hosts reachable only through a jump host
+(`ProxyJump`/bastion) with **no direct UDP route**, pass `--via-ssh`:
+
+```
+portmanager --via-ssh backend 8000
+portmanager --via-ssh backend podman:web@10.88.0.5:5432->5432
+```
+
+In this mode the agent listens on a **loopback TCP port** instead of QUIC, and
+the client carries the data plane over `ssh -N -L` — so any configured
+`ProxyJump` applies automatically and SSH's own channel multiplexing moves every
+forwarded connection. SSH is the trust anchor (no separate TLS); each connection
+is gated by the session token. No directly reachable port and no firewall hole
+are needed. The choice is remembered per host, so a later plain
+`portmanager backend` keeps using it.
+
+It still reconnects like the QUIC path: the agent daemon persists across SSH
+death, so a dropped tunnel is re-stood and reattached; only when the agent is
+gone does it re-bootstrap. Throughput is bounded by the single SSH channel — fine
+for dev/db/web forwards; expect SSH-tunnel speeds for bulk transfers. All other
+features (the `podman:`/`docker:`/`pid:` namespace dialing below, discovery, the
+TUI, the control socket) work unchanged.
+
 ### Forward spec grammar
 
 ```
