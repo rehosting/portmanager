@@ -77,7 +77,7 @@ async fn agent_binary_bootstraps_and_forwards() {
     let agent_addr: SocketAddr = (Ipv4Addr::LOCALHOST, ready.udp_port).into();
     let conn = transport::connect(&endpoint, agent_addr).await.unwrap();
 
-    let (_slot_tx, slot_rx) = client::conn_slot(Some(conn));
+    let (_slot_tx, slot_rx) = client::conn_slot(Some(portmanager::conn::Conn::Quic(conn)));
     let forward = ForwardSpec {
         ns: NsSpec::Host,
         remote_host: echo_addr.ip().to_string(),

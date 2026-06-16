@@ -103,10 +103,15 @@ pub async fn run(host: &str) -> Result<()> {
     if hostname.is_some() {
         let advisory =
             crate::firewall::diagnose(host, crate::firewall::AdvisePort::Range(60000, 61000)).await;
-        println!("\nfirewall (agent UDP must be reachable):");
+        println!("\nfirewall (agent UDP must be reachable for the default QUIC transport):");
         for line in advisory.lines() {
             println!("  {line}");
         }
+        println!(
+            "  If inbound UDP can't be opened (e.g. this host is reachable only through a\n  \
+             jump host), run `portmanager --via-ssh {host} ...` to carry the data plane over\n  \
+             SSH instead — no UDP needed."
+        );
     }
 
     // 6. Tail the remote agent log, if present.

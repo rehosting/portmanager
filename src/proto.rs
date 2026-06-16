@@ -7,8 +7,7 @@
 
 use std::io;
 
-use quinn::{RecvStream, SendStream};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// Current stream-protocol version (ALPN also gates this at the TLS layer).
@@ -28,10 +27,10 @@ pub struct StreamHeader {
 }
 
 impl StreamHeader {
-    /// Serialize and write the header to a QUIC send stream.
+    /// Serialize and write the header to a send stream (any `AsyncWrite`).
     ///
     /// Layout: `version:u8 | port:u16_be | host_len:u8 | host | ns_len:u8 | ns`.
-    pub async fn write(&self, send: &mut SendStream) -> io::Result<()> {
+    pub async fn write<W: AsyncWrite + Unpin>(&self, send: &mut W) -> io::Result<()> {
         if self.host.len() > MAX_FIELD || self.ns.len() > MAX_FIELD {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -49,8 +48,8 @@ impl StreamHeader {
         Ok(())
     }
 
-    /// Read and parse a header from a QUIC recv stream.
-    pub async fn read(recv: &mut RecvStream) -> io::Result<Self> {
+    /// Read and parse a header from a recv stream (any `AsyncRead`).
+    pub async fn read<R: AsyncRead + Unpin>(recv: &mut R) -> io::Result<Self> {
         let mut fixed = [0u8; 3];
         recv.read_exact(&mut fixed)
             .await
@@ -69,7 +68,7 @@ impl StreamHeader {
 }
 
 /// Read a `len:u8`-prefixed UTF-8 string.
-async fn read_lp_string(recv: &mut RecvStream) -> io::Result<String> {
+async fn read_lp_string<R: AsyncRead + Unpin>(recv: &mut R) -> io::Result<String> {
     let mut len = [0u8; 1];
     recv.read_exact(&mut len)
         .await
@@ -81,17 +80,24 @@ async fn read_lp_string(recv: &mut RecvStream) -> io::Result<String> {
     String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// Splice a TCP connection to a QUIC bidi stream, both directions, until close.
+/// Splice a TCP connection to a transport bidi stream, both directions, until
+/// close. Works over any send/recv pair (QUIC streams or a TCP-tunnel stream's
+/// halves).
 ///
-/// TCP read -> QUIC send, and QUIC recv -> TCP write run concurrently with
-/// independent half-close: an EOF on one direction finishes that half without
-/// tearing down the other.
-pub async fn splice(tcp: TcpStream, mut send: SendStream, mut recv: RecvStream) -> io::Result<()> {
+/// TCP read -> stream send, and stream recv -> TCP write run concurrently with
+/// independent half-close: an EOF on one direction finishes that half (via
+/// `shutdown`, which finishes a QUIC send stream) without tearing down the
+/// other.
+pub async fn splice<W, R>(tcp: TcpStream, mut send: W, mut recv: R) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
     let (mut tcp_read, mut tcp_write) = tcp.into_split();
 
     let upstream = async {
         tokio::io::copy(&mut tcp_read, &mut send).await?;
-        let _ = send.finish();
+        let _ = send.shutdown().await;
         Ok::<(), io::Error>(())
     };
     let downstream = async {

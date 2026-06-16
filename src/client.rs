@@ -14,12 +14,12 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use quinn::Connection;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use crate::conn::Conn;
 use crate::error;
 use crate::forward::ForwardSpec;
 use crate::proto::{self, StreamHeader};
@@ -45,7 +45,7 @@ pub fn attach_deadline() -> Duration {
 }
 
 /// Shared slot holding the current agent connection (`None` while reconnecting).
-pub type ConnSlot = watch::Receiver<Option<Connection>>;
+pub type ConnSlot = watch::Receiver<Option<Conn>>;
 
 /// Live health of one forward, updated as connections through it succeed/fail.
 /// This is what lets `add`/`list`/`status` explain *why* a forward does nothing
@@ -100,7 +100,7 @@ pub struct ForwardSnapshot {
 }
 
 /// Create a connection slot pair.
-pub fn conn_slot(initial: Option<Connection>) -> (watch::Sender<Option<Connection>>, ConnSlot) {
+pub fn conn_slot(initial: Option<Conn>) -> (watch::Sender<Option<Conn>>, ConnSlot) {
     watch::channel(initial)
 }
 

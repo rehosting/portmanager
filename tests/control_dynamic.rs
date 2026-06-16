@@ -62,7 +62,7 @@ async fn control_socket_add_drop_list_status() {
     let conn = session().await;
     let echo = spawn_echo().await;
 
-    let (_slot_tx, slot_rx) = conn_slot(Some(conn));
+    let (_slot_tx, slot_rx) = conn_slot(Some(portmanager::conn::Conn::Quic(conn)));
     let forwards = Arc::new(ForwardSet::new(slot_rx));
     let (_status_tx, status_rx) = watch::channel(Status::Connected);
 
@@ -162,7 +162,7 @@ async fn discovery_autoforwards_new_listener() {
     let host = format!("testdisc-{}", std::process::id());
     let conn = session().await;
 
-    let (slot_tx, slot_rx) = conn_slot(Some(conn));
+    let (slot_tx, slot_rx) = conn_slot(Some(portmanager::conn::Conn::Quic(conn)));
     let forwards = Arc::new(ForwardSet::new(slot_rx.clone()));
 
     // Start a listener *after* session start, then a rule that matches it.

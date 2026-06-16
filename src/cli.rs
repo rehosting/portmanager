@@ -47,6 +47,12 @@ pub struct RunArgs {
     #[arg(long)]
     pub remote_udp: Option<String>,
 
+    /// Carry the data plane over SSH (`ssh -L`) instead of a direct QUIC/UDP
+    /// channel. Use for hosts reachable only through a jump host (ProxyJump)
+    /// with no direct UDP path. Remembered per host once used.
+    #[arg(long)]
+    pub via_ssh: bool,
+
     /// How long the remote agent keeps the session alive after the last client
     /// disconnects, before self-reaping (the re-attach window for roaming /
     /// sleeping clients). Accepts `30s`, `15m`, `12h`, `2d` — a bare number is
@@ -163,6 +169,12 @@ pub struct AgentArgs {
     /// daemonizing (used by tests and for debugging).
     #[arg(long)]
     pub foreground: bool,
+
+    /// Serve the SSH-tunnel transport: listen on a loopback TCP port (carried by
+    /// the client's `ssh -L`) instead of a QUIC/UDP listener. Set automatically
+    /// by the client's bootstrap; not for manual use.
+    #[arg(long)]
+    pub tunnel: bool,
 }
 
 #[cfg(test)]

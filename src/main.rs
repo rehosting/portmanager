@@ -44,6 +44,7 @@ fn main() -> Result<()> {
             &args.listen,
             Duration::from_secs(args.grace_secs),
             args.foreground,
+            args.tunnel,
         ),
         Some(Command::NsHelper) => netns::run_helper(),
         Some(cmd) => block_on(run_control_command(cmd)),
@@ -215,7 +216,7 @@ async fn run_client(
     let tui_mode = log_buf.is_some();
     // Resolve host, initial forwards, rules, and the persistence target from
     // either a named profile or the per-host remembered state.
-    let (host, mut forwards, rules, persist) = if let Some(name) = &args.profile {
+    let (host, mut forwards, rules, persist, via_ssh) = if let Some(name) = &args.profile {
         let config = tokio::task::spawn_blocking(config::load_config).await??;
         let profile = config
             .profiles
@@ -240,6 +241,7 @@ async fn run_client(
             forwards,
             profile.autoforward.clone(),
             config::PersistTarget::Profile { name: name.clone() },
+            args.via_ssh || profile.via_ssh,
         )
     } else {
         let host = args
@@ -262,11 +264,13 @@ async fn run_client(
                 forwards.push((remembered, Origin::Remembered));
             }
         }
+        let via_ssh = args.via_ssh || state.via_ssh;
         (
             host.clone(),
             forwards,
             state.autoforward,
             config::PersistTarget::HostState { host },
+            via_ssh,
         )
     };
 
@@ -289,18 +293,39 @@ async fn run_client(
         );
     }
 
+    // Refuse a second session for the same host on this machine: the control
+    // socket is per-host, so a second launch couldn't be managed and would only
+    // bootstrap a redundant (leaked) agent. Fail fast, before bootstrapping.
+    if control::session_is_live(&host).await {
+        bail!(
+            "a portmanager session for {host:?} is already running on this machine — \
+             manage it with `portmanager list|add|stop {host}`, or stop it first"
+        );
+    }
+
+    // Remember the tunnel choice so a later plain `portmanager <host>` keeps it.
+    if via_ssh && let config::PersistTarget::HostState { host } = &persist {
+        let host = host.clone();
+        let _ = tokio::task::spawn_blocking(move || config::remember_via_ssh(&host)).await;
+    }
+
     let supervisor = Supervisor::start(
         host.clone(),
         args.remote_udp.clone(),
         verbose,
         args.agent_grace.as_secs(),
+        via_ssh,
     )
     .await
     .map_err(|e| {
-        e.context(
-            "session bootstrap failed — note the remote must allow inbound UDP \
-                 (not just SSH/22) for the QUIC channel",
-        )
+        // The UDP-failure path attaches its own options message at the source
+        // (firewall::udp_failure_message); other bootstrap errors (ssh/arch) are
+        // self-describing. Only the tunnel path needs a top-level hint here.
+        if via_ssh {
+            e.context("session bootstrap failed over the SSH tunnel")
+        } else {
+            e
+        }
     })?;
 
     let forward_set = Arc::new(ForwardSet::new(supervisor.slot.clone()));
@@ -395,6 +420,14 @@ fn spawn_daemon(args: &cli::RunArgs, verbose: u8) -> Result<()> {
     use std::process::Stdio;
 
     let host = daemon_host(args)?;
+    // Fast-fail before forking a redundant daemon (which would bootstrap a
+    // leaked agent and never own the per-host control socket).
+    if control::session_is_live_blocking(&host) {
+        bail!(
+            "a portmanager session for {host:?} is already running on this machine — \
+             manage it with `portmanager list|add|stop {host}`, or stop it first"
+        );
+    }
     let exe = std::env::current_exe().context("resolving current executable")?;
     let log_dir = directories::BaseDirs::new()
         .map(|d| d.cache_dir().join("portmanager"))

@@ -23,15 +23,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt};
+use quinn::{Connection, ConnectionError, Endpoint, VarInt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
+use crate::conn::{OP_KEEPALIVE, OP_SHUTDOWN, OP_STREAM};
 use crate::crypto::{self, Identity};
 use crate::error;
 use crate::forward::NsSpec;
-use crate::handshake::{Hello, Ready, SessionId};
+use crate::handshake::{Hello, Ready, SessionId, Token};
 use crate::netns::HelperPool;
 use crate::proto::{self, StreamHeader};
 
@@ -42,11 +44,17 @@ pub const CLOSE_SHUTDOWN: u32 = 0x10;
 ///
 /// Sync on purpose: the handshake and daemonization happen before any tokio
 /// runtime exists, so the fork is single-threaded and safe.
-pub fn run(listen: &str, grace: Duration, foreground: bool) -> Result<()> {
+pub fn run(listen: &str, grace: Duration, foreground: bool, tunnel: bool) -> Result<()> {
     // 1. Handshake on the SSH session's stdio.
     let hello = read_hello_stdin()?;
     let identity = Identity::generate()?;
     let session_id = SessionId::random()?;
+
+    // SSH-tunnel transport: serve over a loopback TCP listener instead of QUIC
+    // (the data plane rides `ssh -L`; SSH is the trust anchor, no TLS here).
+    if tunnel {
+        return run_tunnel(listen, grace, foreground, identity, session_id, hello.token);
+    }
 
     // 2. Bind the QUIC UDP socket pre-fork so the reported port is final.
     let bind: SocketAddr = listen.parse().context("parsing --listen address")?;
@@ -214,26 +222,11 @@ pub async fn serve_with_grace(
     info!(addr = ?endpoint.local_addr().ok(), grace_secs = grace.as_secs(), "agent listening");
 
     // (active connection count, explicit-shutdown flag)
-    let (state_tx, mut state_rx) = watch::channel((0usize, false));
+    let (state_tx, state_rx) = watch::channel((0usize, false));
     // Namespace connect-helpers live as long as the session (reused across
     // client reconnects, torn down when the agent exits).
     let pool = Arc::new(HelperPool::new());
-
-    // Mirror the live client count into the state file so a future bootstrap's
-    // reaper only evicts this agent when it is idle (clients == 0).
-    if let Some(path) = state_path {
-        let udp_port = endpoint.local_addr().map(|a| a.port()).unwrap_or(0);
-        let mut rx = state_rx.clone();
-        tokio::spawn(async move {
-            loop {
-                let clients = rx.borrow_and_update().0;
-                write_agent_state_at(&path, udp_port, clients);
-                if rx.changed().await.is_err() {
-                    break;
-                }
-            }
-        });
-    }
+    let port = endpoint.local_addr().map(|a| a.port()).unwrap_or(0);
 
     let accept_endpoint = endpoint.clone();
     let accept = tokio::spawn(async move {
@@ -256,7 +249,38 @@ pub async fn serve_with_grace(
         }
     });
 
-    // Grace supervisor: wait out periods with zero connections.
+    grace_loop(state_rx, grace, state_path, port).await;
+
+    accept.abort();
+    endpoint.close(VarInt::from_u32(0), b"agent exiting");
+    Ok(())
+}
+
+/// Shared grace supervisor: mirror the live client count into the state file and
+/// wait out periods with zero connections; return on explicit shutdown or once
+/// the grace window elapses with no client attached. Transport-agnostic — both
+/// the QUIC and SSH-tunnel serve paths drive it via their own accept loops.
+async fn grace_loop(
+    mut state_rx: watch::Receiver<(usize, bool)>,
+    grace: Duration,
+    state_path: Option<std::path::PathBuf>,
+    port: u16,
+) {
+    // Mirror the live client count into the state file so a future bootstrap's
+    // reaper only evicts this agent when it is idle (clients == 0).
+    if let Some(path) = state_path {
+        let mut rx = state_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                let clients = rx.borrow_and_update().0;
+                write_agent_state_at(&path, port, clients);
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
     loop {
         let (count, shutdown) = *state_rx.borrow_and_update();
         if shutdown {
@@ -298,10 +322,155 @@ pub async fn serve_with_grace(
             break;
         }
     }
+}
 
+/// SSH-tunnel serve path: bind a loopback TCP listener (the `ssh -L` target),
+/// report its port, daemonize, and serve token-gated connections. No TLS — SSH
+/// is the trust anchor; the session token authorizes each connection.
+fn run_tunnel(
+    listen: &str,
+    grace: Duration,
+    foreground: bool,
+    identity: Identity,
+    session_id: SessionId,
+    token: Token,
+) -> Result<()> {
+    let bind: SocketAddr = listen.parse().context("parsing --listen address")?;
+    let listener = std::net::TcpListener::bind(bind).context("binding agent TCP listener")?;
+    let local = listener.local_addr().context("reading bound TCP address")?;
+
+    let ready = Ready {
+        udp_port: local.port(), // the loopback TCP port the client forwards to
+        agent_fp: identity.fingerprint, // unused in tunnel mode (no TLS)
+        session_id,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    {
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(ready.to_line().as_bytes())
+            .and_then(|_| stdout.flush())
+            .context("writing ready handshake to stdout")?;
+    }
+
+    if !foreground {
+        daemonize()?;
+    }
+
+    let state_path = if foreground {
+        None
+    } else {
+        write_agent_state(local.port())
+    };
+    let state_path_for_serve = state_path.clone();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")?;
+    let result = runtime.block_on(async move {
+        listener
+            .set_nonblocking(true)
+            .context("setting TCP listener non-blocking")?;
+        let listener =
+            tokio::net::TcpListener::from_std(listener).context("adopting TCP listener")?;
+        serve_tunnel_with_grace(listener, grace, state_path_for_serve, token).await
+    });
+
+    if let Some(path) = state_path {
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
+/// Accept token-gated tunnel connections, tracking live clients for the grace
+/// window exactly like the QUIC path.
+async fn serve_tunnel_with_grace(
+    listener: tokio::net::TcpListener,
+    grace: Duration,
+    state_path: Option<std::path::PathBuf>,
+    token: Token,
+) -> Result<()> {
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    info!(addr = ?listener.local_addr().ok(), grace_secs = grace.as_secs(), "agent listening (ssh tunnel)");
+
+    let (state_tx, state_rx) = watch::channel((0usize, false));
+    let pool = Arc::new(HelperPool::new());
+    let token = Arc::new(token);
+
+    let accept = tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((tcp, _peer)) => {
+                    tokio::spawn(handle_tunnel_conn(
+                        tcp,
+                        token.clone(),
+                        pool.clone(),
+                        state_tx.clone(),
+                    ));
+                }
+                Err(e) => {
+                    warn!(error = %e, "tunnel accept failed");
+                    break;
+                }
+            }
+        }
+    });
+
+    grace_loop(state_rx, grace, state_path, port).await;
     accept.abort();
-    endpoint.close(VarInt::from_u32(0), b"agent exiting");
     Ok(())
+}
+
+/// One tunnel connection: verify the token, read the opcode, and dispatch.
+async fn handle_tunnel_conn(
+    mut tcp: TcpStream,
+    token: Arc<Token>,
+    pool: Arc<HelperPool>,
+    state_tx: watch::Sender<(usize, bool)>,
+) {
+    let mut received = [0u8; 32];
+    if tcp.read_exact(&mut received).await.is_err() {
+        return;
+    }
+    if !Token::from_bytes(received).ct_eq(&token) {
+        warn!(peer = ?tcp.peer_addr().ok(), "tunnel connection failed token check");
+        return;
+    }
+    let opcode = match tcp.read_u8().await {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+
+    match opcode {
+        OP_KEEPALIVE => {
+            // The persistent liveness connection: count it as a client and hold
+            // it open until it closes (carries no payload).
+            state_tx.send_modify(|(n, _)| *n += 1);
+            let mut buf = [0u8; 64];
+            loop {
+                match tcp.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            state_tx.send_modify(|(n, _)| *n -= 1);
+        }
+        OP_SHUTDOWN => {
+            info!("client requested shutdown (tunnel)");
+            state_tx.send_modify(|(_, s)| *s = true);
+        }
+        OP_STREAM => {
+            state_tx.send_modify(|(n, _)| *n += 1);
+            let (read, write) = tcp.into_split();
+            if let Err(e) = handle_stream(write, read, pool).await {
+                let error = error::format_chain(&e);
+                warn!(%error, "tunnel stream failed");
+            }
+            state_tx.send_modify(|(n, _)| *n -= 1);
+        }
+        other => debug!(opcode = other, "unknown tunnel opcode"),
+    }
 }
 
 /// Serve all bidi streams on one authenticated connection.
@@ -334,11 +503,13 @@ async fn handle_connection(conn: Connection, pool: Arc<HelperPool>) -> bool {
 }
 
 /// Read the header, dial the target (in-namespace when requested), and splice.
-async fn handle_stream(
-    mut send: SendStream,
-    mut recv: RecvStream,
-    pool: Arc<HelperPool>,
-) -> Result<()> {
+/// Generic over the transport's stream halves (QUIC streams or a tunnel TCP
+/// connection's halves).
+async fn handle_stream<W, R>(send: W, mut recv: R, pool: Arc<HelperPool>) -> Result<()>
+where
+    W: AsyncWrite + Send + Unpin,
+    R: AsyncRead + Send + Unpin,
+{
     let header = StreamHeader::read(&mut recv)
         .await
         .context("reading stream header")?;
@@ -351,29 +522,16 @@ async fn handle_stream(
     let target = format!("{}:{}", header.host, header.port);
     let tcp = if header.ns.is_empty() {
         debug!(%target, "dialing target");
-        match TcpStream::connect(&target).await {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = send.reset(VarInt::from_u32(2));
-                return Err(e).context(format!("connecting to {target}"));
-            }
-        }
+        TcpStream::connect(&target)
+            .await
+            .with_context(|| format!("connecting to {target}"))?
     } else {
-        let ns = match NsSpec::from_wire(&header.ns) {
-            Ok(ns) => ns,
-            Err(e) => {
-                let _ = send.reset(VarInt::from_u32(1));
-                anyhow::bail!("bad namespace selector {:?}: {e}", header.ns);
-            }
-        };
+        let ns = NsSpec::from_wire(&header.ns)
+            .map_err(|e| anyhow::anyhow!("bad namespace selector {:?}: {e}", header.ns))?;
         debug!(%target, ns = %header.ns, "dialing target in namespace");
-        match pool.connect(&ns, &header.host, header.port).await {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = send.reset(VarInt::from_u32(1));
-                return Err(e).context(format!("connecting to {target} in {}", header.ns));
-            }
-        }
+        pool.connect(&ns, &header.host, header.port)
+            .await
+            .with_context(|| format!("connecting to {target} in {}", header.ns))?
     };
 
     proto::splice(tcp, send, recv).await.context("splicing")?;
