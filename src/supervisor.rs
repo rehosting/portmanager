@@ -108,7 +108,8 @@ impl Supervisor {
                 // --remote-udp / --via-ssh) to the *error* — not just a log line
                 // — so it's visible in every mode, including a TUI launch that
                 // aborts before the TUI (and its log pane) ever appears.
-                let options = firewall::udp_failure_message(&host, advise_port(listen.as_deref())).await;
+                let options =
+                    firewall::udp_failure_message(&host, advise_port(listen.as_deref())).await;
                 return Err(e).context(options);
             }
         };
@@ -164,7 +165,10 @@ impl Supervisor {
         let conn = SshConn::connect(tunnel.local, session.token.clone())
             .await
             .context("connecting through the ssh -L tunnel")?;
-        info!(port = session.tcp_port, "connected to agent over ssh tunnel");
+        info!(
+            port = session.tcp_port,
+            "connected to agent over ssh tunnel"
+        );
         status_tx.send_replace(Status::Connected);
 
         let (slot_tx, slot_rx) = client::conn_slot(Some(Conn::Ssh(conn.clone())));

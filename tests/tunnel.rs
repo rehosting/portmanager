@@ -7,11 +7,11 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::process::Stdio;
 use std::time::Duration;
 
+use portmanager::client;
 use portmanager::conn::{Conn, OP_STREAM, SshConn};
 use portmanager::crypto::{self, Identity};
 use portmanager::forward::{ForwardSpec, NsSpec};
 use portmanager::handshake::{Hello, Ready, Token};
-use portmanager::client;
 use portmanager::proto::StreamHeader;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};

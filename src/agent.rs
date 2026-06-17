@@ -340,7 +340,7 @@ fn run_tunnel(
     let local = listener.local_addr().context("reading bound TCP address")?;
 
     let ready = Ready {
-        udp_port: local.port(), // the loopback TCP port the client forwards to
+        udp_port: local.port(),         // the loopback TCP port the client forwards to
         agent_fp: identity.fingerprint, // unused in tunnel mode (no TLS)
         session_id,
         version: env!("CARGO_PKG_VERSION").to_string(),

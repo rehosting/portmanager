@@ -19,10 +19,10 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::client::ForwardSet;
-use crate::conn::Conn;
 use crate::client::ConnSlot;
+use crate::client::ForwardSet;
 use crate::config::{self, AutoForwardRule, HostState};
+use crate::conn::Conn;
 use crate::forward::{ForwardSpec, NsSpec};
 #[cfg(target_os = "linux")]
 use crate::netns;
