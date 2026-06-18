@@ -6,9 +6,12 @@
 //! and then bytes are spliced both ways until either side closes.
 
 use std::io;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 
-use quinn::{RecvStream, SendStream};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
 /// Current stream-protocol version (ALPN also gates this at the TLS layer).
@@ -28,10 +31,10 @@ pub struct StreamHeader {
 }
 
 impl StreamHeader {
-    /// Serialize and write the header to a QUIC send stream.
+    /// Serialize and write the header to a send stream (any `AsyncWrite`).
     ///
     /// Layout: `version:u8 | port:u16_be | host_len:u8 | host | ns_len:u8 | ns`.
-    pub async fn write(&self, send: &mut SendStream) -> io::Result<()> {
+    pub async fn write<W: AsyncWrite + Unpin>(&self, send: &mut W) -> io::Result<()> {
         if self.host.len() > MAX_FIELD || self.ns.len() > MAX_FIELD {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -49,8 +52,8 @@ impl StreamHeader {
         Ok(())
     }
 
-    /// Read and parse a header from a QUIC recv stream.
-    pub async fn read(recv: &mut RecvStream) -> io::Result<Self> {
+    /// Read and parse a header from a recv stream (any `AsyncRead`).
+    pub async fn read<R: AsyncRead + Unpin>(recv: &mut R) -> io::Result<Self> {
         let mut fixed = [0u8; 3];
         recv.read_exact(&mut fixed)
             .await
@@ -69,7 +72,7 @@ impl StreamHeader {
 }
 
 /// Read a `len:u8`-prefixed UTF-8 string.
-async fn read_lp_string(recv: &mut RecvStream) -> io::Result<String> {
+async fn read_lp_string<R: AsyncRead + Unpin>(recv: &mut R) -> io::Result<String> {
     let mut len = [0u8; 1];
     recv.read_exact(&mut len)
         .await
@@ -81,17 +84,37 @@ async fn read_lp_string(recv: &mut RecvStream) -> io::Result<String> {
     String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// Splice a TCP connection to a QUIC bidi stream, both directions, until close.
+/// Splice a TCP connection to a transport bidi stream, both directions, until
+/// close. Works over any send/recv pair (QUIC streams or a TCP-tunnel stream's
+/// halves).
 ///
-/// TCP read -> QUIC send, and QUIC recv -> TCP write run concurrently with
-/// independent half-close: an EOF on one direction finishes that half without
-/// tearing down the other.
-pub async fn splice(tcp: TcpStream, mut send: SendStream, mut recv: RecvStream) -> io::Result<()> {
-    let (mut tcp_read, mut tcp_write) = tcp.into_split();
+/// TCP read -> stream send, and stream recv -> TCP write run concurrently with
+/// independent half-close: an EOF on one direction finishes that half (via
+/// `shutdown`, which finishes a QUIC send stream) without tearing down the
+/// other.
+///
+/// `bytes_up`/`bytes_down` are bumped live as bytes flow (client->agent and
+/// agent->client respectively), driving the TUI's per-forward throughput
+/// display. Counting wraps the TCP halves so it reflects the application's own
+/// payload, independent of the transport framing.
+pub async fn splice<W, R>(
+    tcp: TcpStream,
+    mut send: W,
+    mut recv: R,
+    bytes_up: Arc<AtomicU64>,
+    bytes_down: Arc<AtomicU64>,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let (tcp_read, tcp_write) = tcp.into_split();
+    let mut tcp_read = Counted::new(tcp_read, bytes_up);
+    let mut tcp_write = Counted::new(tcp_write, bytes_down);
 
     let upstream = async {
         tokio::io::copy(&mut tcp_read, &mut send).await?;
-        let _ = send.finish();
+        let _ = send.shutdown().await;
         Ok::<(), io::Error>(())
     };
     let downstream = async {
@@ -102,6 +125,61 @@ pub async fn splice(tcp: TcpStream, mut send: SendStream, mut recv: RecvStream) 
 
     tokio::try_join!(upstream, downstream)?;
     Ok(())
+}
+
+/// Wraps an `AsyncRead`/`AsyncWrite`, adding each transferred byte to a shared
+/// counter. Used per direction in [`splice`] for live throughput accounting.
+/// Requires `S: Unpin` (the owned TCP halves are), so it can poll the inner
+/// handle without pin-projection.
+struct Counted<S> {
+    inner: S,
+    count: Arc<AtomicU64>,
+}
+
+impl<S> Counted<S> {
+    fn new(inner: S, count: Arc<AtomicU64>) -> Self {
+        Counted { inner, count }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Counted<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let r = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &r {
+            let n = buf.filled().len() - before;
+            this.count.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        r
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let r = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &r {
+            this.count.fetch_add(*n as u64, Ordering::Relaxed);
+        }
+        r
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
 }
 
 #[cfg(test)]
@@ -125,5 +203,27 @@ mod tests {
         assert_eq!(buf[0], 1);
         assert_eq!(&buf[1..3], &[0x22, 0xb8]); // 8888
         assert_eq!(buf[3], 9); // len("127.0.0.1")
+    }
+
+    #[tokio::test]
+    async fn counted_tallies_bytes_in_both_directions() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Writer side: every written byte lands in the counter.
+        let (a, b) = tokio::io::duplex(64);
+        let wc = Arc::new(AtomicU64::new(0));
+        let mut writer = Counted::new(a, wc.clone());
+        writer.write_all(b"hello world").await.unwrap();
+        writer.flush().await.unwrap();
+        assert_eq!(wc.load(Ordering::Relaxed), 11);
+
+        // Reader side: every byte read through the wrapper is tallied.
+        let rc = Arc::new(AtomicU64::new(0));
+        let mut reader = Counted::new(b.take(11), rc.clone());
+        let mut sink = Vec::new();
+        reader.read_to_end(&mut sink).await.unwrap();
+        assert_eq!(sink, b"hello world");
+        assert_eq!(rc.load(Ordering::Relaxed), 11);
+        drop(writer);
     }
 }

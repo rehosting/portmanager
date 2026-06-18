@@ -15,10 +15,36 @@ INFO forward up local=127.0.0.1:5432 target=10.88.0.5:5432 ns=podman:web
 INFO session up — Ctrl-C to stop
 ```
 
-Run the local client in the background with `--daemon`:
+Launched on a terminal, the foreground client opens an **interactive TUI** — a
+VSCode-style table of forwards (Port · Forwarded Address · Running Process ·
+Namespace · Visibility · Origin · Rate · Health) with a session-state header and
+a log pane. You don't need to pass any specs: start `portmanager myhost` and add
+them live.
+
+```text
+portmanager  myhost  connected  agent v0.1.0
+┌ forwards (2) ───────────────────────────────────────────────────────────────────────┐
+│ Port    Forwarded Address    Running Process   Namespace  Visibility  Origin  Rate    │
+│▶ 8888   127.0.0.1:8888       node (5123)       host       private     user    1.2 MiB/s│
+│  5432   10.88.0.5:5432       postgres (1847)   podman:web private     user    idle     │
+└───────────────────────────────────────────────────────────────────────────────────────┘
+ a add  d drop  o open  y copy  i detail  v vis  f find  / filter  ? help  q quit
+```
+
+Keys: `a` add a forward (type any spec), `d` drop the selected one (with a `y/n`
+confirm), `o` open it in your web browser (`http://127.0.0.1:<port>`), `y` copy
+its URL to the clipboard, `i` inspect it (full health, byte counts, and a live
+throughput sparkline), `v` toggle its visibility (loopback ↔ exposed on
+`0.0.0.0`), `f` open the **discovered-ports picker** to forward a port the agent
+sees but you haven't forwarded yet, `/` filter the table, `PgUp`/`PgDn` scroll
+the log, `?` show all keys, `q` quit. The "Rate" column and detail sparkline show
+live throughput. "Running Process" is resolved on the remote (Linux remotes
+only). Piped/non-TTY invocations fall back to plain logging.
+
+Run the local client in the background (no TUI) with `-d`/`--daemon`:
 
 ```console
-$ portmanager --daemon myhost 8888 db.internal:5432
+$ portmanager -d myhost 8888 db.internal:5432
 $ portmanager status myhost
 $ portmanager stop myhost
 ```
@@ -47,22 +73,67 @@ $ portmanager stop myhost
 4. Each forwarded TCP connection is one QUIC stream; everything multiplexes
    over a single connection.
 
+### SSH-tunnel transport (`--via-ssh`)
+
+The QUIC data channel dials the agent's UDP port **directly** — which needs a
+UDP path from client to agent. For hosts reachable only through a jump host
+(`ProxyJump`/bastion) with **no direct UDP route**, pass `--via-ssh`:
+
+```
+portmanager --via-ssh backend 8000
+portmanager --via-ssh backend podman:web@10.88.0.5:5432->5432
+```
+
+In this mode the agent listens on a **loopback TCP port** instead of QUIC, and
+the client carries the data plane over `ssh -N -L` — so any configured
+`ProxyJump` applies automatically and SSH's own channel multiplexing moves every
+forwarded connection. SSH is the trust anchor (no separate TLS); each connection
+is gated by the session token. No directly reachable port and no firewall hole
+are needed. The choice is remembered per host, so a later plain
+`portmanager backend` keeps using it.
+
+It still reconnects like the QUIC path: the agent daemon persists across SSH
+death, so a dropped tunnel is re-stood and reattached; only when the agent is
+gone does it re-bootstrap. Throughput is bounded by the single SSH channel — fine
+for dev/db/web forwards; expect SSH-tunnel speeds for bulk transfers. All other
+features (the `podman:`/`docker:`/`pid:` namespace dialing below, discovery, the
+TUI, the control socket) work unchanged.
+
 ### Forward spec grammar
 
 ```
-[NS@][HOST:]PORT[->LOCALPORT]
+[NS@][HOST:]PORT[->[BINDADDR:]LOCALPORT]
+[NS@]socks[->LOCALPORT]
 
 8888                          # remote 127.0.0.1:8888 -> local 8888, or a free port if busy
 192.168.4.2:8080              # remote 192.168.4.2:8080 -> local 8080, or a free port if busy
 192.168.4.2:8080->8080        # a host on the remote's network
+8080->0.0.0.0:8080            # expose the forward on the LAN, not just loopback
 podman:web@10.88.0.5:5432->5432   # inside a rootless container's netns
 pid:1234@8080                 # inside any process's netns (yours)
 nspath:/run/user/1000/netns/x@80  # explicit namespace file
+socks                         # a SOCKS5 proxy on local 1080 -> the remote's whole network
+socks->9050                   # ...on a specific local port
+podman:web@socks->1080        # ...whose targets are dialed from inside a container's netns
 ```
 
 If `->LOCALPORT` is omitted, portmanager prefers the same local port and falls
 back to an available ephemeral port. If `->LOCALPORT` is present, that local
-port is strict and binding fails if it is unavailable.
+port is strict and binding fails if it is unavailable. An optional `BINDADDR:`
+before the local port sets the listener's bind address — loopback by default
+(private), or `0.0.0.0` to expose the forward on the LAN. The TUI's `v` key
+toggles this on a live forward.
+
+### SOCKS5 dynamic proxy
+
+`socks` binds a local SOCKS5 proxy instead of a fixed-target forward — the
+`ssh -D` equivalent. Point a browser, `proxychains`, or `curl --socks5-hostname
+localhost:1080 …` at it and every connection is dialed by the agent on the
+remote, so you reach the remote's entire network from one port. Hostnames
+resolve **on the remote** (remote DNS), so internal names that only resolve over
+there just work. Prefixing a namespace (`podman:web@socks->1080`) dials every
+proxied connection from *inside* that container's network view. SOCKS proxies
+are loopback-only (no LAN exposure) and support no-auth CONNECT.
 
 Namespace dialing enters rootless namespaces (userns+netns, the
 `podman unshare` trick) via a resident per-namespace helper that hands
@@ -136,8 +207,12 @@ local = "same"       # mirror remote port; fall back to a free one
   you. `portmanager doctor <host>` reports this proactively. Cloud security
   groups / network ACLs are separate and must be opened in your provider.
 - The agent's UDP listener is mutually authenticated, but it *is* a listening
-  port run with your remote user's privileges; the grace window
-  (`--grace-secs`, default 300) bounds how long it outlives a client.
+  port run with your remote user's privileges; the grace window bounds how long
+  it outlives a client. After the last client disconnects the agent waits this
+  long for a re-attach (roaming/sleep/outage) before self-reaping. The default
+  is **12 hours**; set it per-launch with `--agent-grace` (`30s`/`15m`/`12h`/`2d`,
+  a bare number is seconds — e.g. `--agent-grace 2d` to survive a weekend, or
+  `--agent-grace 5m` to reap quickly).
 - One client per session. The control socket prevents a second client for the
   same host on one machine; two separate launches get separate agent sessions.
   Sharing a single session across clients (by copying its secrets) is

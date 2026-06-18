@@ -8,7 +8,7 @@
 set -uo pipefail
 HOST="${1:-${PM_HOST:-localhost}}"
 dir="$(dirname "$0")"
-scenarios=(add_forward forward_ip forward_netns health clear_forget)
+scenarios=(add_forward forward_ip forward_netns socks socks_netns health clear_forget via_ssh)
 
 # Parallel indexed arrays (no associative arrays — must work on bash 3.2/macOS).
 statuses=()

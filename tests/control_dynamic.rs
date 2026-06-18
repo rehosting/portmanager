@@ -8,11 +8,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use portmanager::client::{ForwardSet, conn_slot};
+// Only used by the Linux-gated discovery test below.
+#[cfg(target_os = "linux")]
 use portmanager::config::AutoForwardRule;
 use portmanager::control::{self, ControlCtx, Request, Response};
 use portmanager::crypto::{self, Identity, Timing};
+#[cfg(target_os = "linux")]
+use portmanager::discovery;
 use portmanager::supervisor::Status;
-use portmanager::{agent, discovery, transport};
+use portmanager::{agent, transport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -58,7 +62,7 @@ async fn control_socket_add_drop_list_status() {
     let conn = session().await;
     let echo = spawn_echo().await;
 
-    let (_slot_tx, slot_rx) = conn_slot(Some(conn));
+    let (_slot_tx, slot_rx) = conn_slot(Some(portmanager::conn::Conn::Quic(conn)));
     let forwards = Arc::new(ForwardSet::new(slot_rx));
     let (_status_tx, status_rx) = watch::channel(Status::Connected);
 
@@ -158,7 +162,7 @@ async fn discovery_autoforwards_new_listener() {
     let host = format!("testdisc-{}", std::process::id());
     let conn = session().await;
 
-    let (slot_tx, slot_rx) = conn_slot(Some(conn));
+    let (slot_tx, slot_rx) = conn_slot(Some(portmanager::conn::Conn::Quic(conn)));
     let forwards = Arc::new(ForwardSet::new(slot_rx.clone()));
 
     // Start a listener *after* session start, then a rule that matches it.
@@ -174,6 +178,7 @@ async fn discovery_autoforwards_new_listener() {
         slot_rx,
         forwards.clone(),
         rules,
+        None,
     ));
 
     // Wait for the scanner to find it and the watcher to bind it.

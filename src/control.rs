@@ -291,8 +291,9 @@ async fn entries(ctx: &ControlCtx) -> Vec<ForwardEntry> {
         .collect()
 }
 
-/// Render one forward's live health for `list`/`status`.
-fn health_label(connected: bool, s: &crate::client::ForwardSnapshot) -> String {
+/// Render one forward's live health for `list`/`status` (and the TUI's Health
+/// column).
+pub fn health_label(connected: bool, s: &crate::client::ForwardSnapshot) -> String {
     if !connected {
         return "session reconnecting".to_string();
     }
@@ -306,7 +307,10 @@ fn health_label(connected: bool, s: &crate::client::ForwardSnapshot) -> String {
 
 async fn add_forward(spec: &str, ctx: &ControlCtx) -> Result<std::net::SocketAddr> {
     let parsed: ForwardSpec = spec.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let local = ctx.forwards.add(parsed).await?;
+    let local = ctx
+        .forwards
+        .add(parsed, crate::client::Origin::UserAdded)
+        .await?;
     persist(ctx).await;
     Ok(local)
 }
@@ -345,24 +349,84 @@ async fn persist(ctx: &ControlCtx) {
 
 /// Canonical CLI-grammar rendering of a spec (parseable back).
 pub fn display_spec(spec: &ForwardSpec) -> String {
+    use std::net::{IpAddr, Ipv4Addr};
+
     let ns = spec.ns.to_wire();
     let prefix = if ns.is_empty() {
         String::new()
     } else {
         format!("{ns}@")
     };
-    if spec.local_port_auto {
-        // Auto local port: persist the short (preferred) form regardless of the
-        // actually-bound port. Otherwise a fallback to an ephemeral port would
-        // be written as a strict `->NNNNN` and frozen on the next launch,
-        // instead of re-preferring the original port. The live bound port is
-        // still visible in `list`'s local column.
+    // A SOCKS proxy has no remote target. Mirror the direct-forward auto-port
+    // rule: an auto local port persists as the short `socks` form (re-preferring
+    // 1080 next launch rather than freezing a fallback port); a pinned port
+    // persists explicitly. Loopback is implied and enforced by the parser.
+    if spec.is_socks() {
+        return if spec.local_port_auto {
+            format!("{prefix}socks")
+        } else {
+            format!("{prefix}socks->{}", spec.local_port)
+        };
+    }
+    let loopback = spec.local_addr == IpAddr::V4(Ipv4Addr::LOCALHOST);
+    if spec.local_port_auto && loopback {
+        // Auto local port on the default loopback bind: persist the short
+        // (preferred) form regardless of the actually-bound port. Otherwise a
+        // fallback to an ephemeral port would be written as a strict `->NNNNN`
+        // and frozen on the next launch, instead of re-preferring the original
+        // port. The live bound port is still visible in `list`'s local column.
         return format!("{prefix}{}:{}", spec.remote_host, spec.remote_port);
     }
+    // A non-loopback bind (an "exposed" forward) forces the explicit form, even
+    // for an auto port: visibility must persist and the port is pinned across
+    // the rebind, so we render the concrete bind address and local port.
+    let local = if loopback {
+        spec.local_port.to_string()
+    } else {
+        let bind = match spec.local_addr {
+            IpAddr::V4(v4) => v4.to_string(),
+            IpAddr::V6(v6) => format!("[{v6}]"),
+        };
+        format!("{bind}:{}", spec.local_port)
+    };
     format!(
         "{prefix}{}:{}->{}",
-        spec.remote_host, spec.remote_port, spec.local_port
+        spec.remote_host, spec.remote_port, local
     )
+}
+
+/// Whether a live session already owns the control socket for `host` (something
+/// answers a connect). Used to fast-fail a second launch *before* bootstrapping
+/// a redundant agent. A socket file that no one is listening on (a crashed
+/// session) reads as not-live — `serve` cleans it up on bind.
+#[cfg(unix)]
+pub async fn session_is_live(host: &str) -> bool {
+    let Ok(path) = socket_path(host) else {
+        return false;
+    };
+    path.exists() && UnixStream::connect(&path).await.is_ok()
+}
+
+/// No Unix-socket control on this platform, so no liveness probe either.
+#[cfg(not(unix))]
+pub async fn session_is_live(_host: &str) -> bool {
+    false
+}
+
+/// Blocking variant of [`session_is_live`], for the pre-fork daemon launcher
+/// (which runs before any tokio runtime exists).
+#[cfg(unix)]
+pub fn session_is_live_blocking(host: &str) -> bool {
+    use std::os::unix::net::UnixStream;
+    let Ok(path) = socket_path(host) else {
+        return false;
+    };
+    path.exists() && UnixStream::connect(&path).is_ok()
+}
+
+#[cfg(not(unix))]
+pub fn session_is_live_blocking(_host: &str) -> bool {
+    false
 }
 
 /// Client side: send one request to the session for `host`.
@@ -411,6 +475,27 @@ pub fn cleanup(_host: &str) {}
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn session_liveness_probe() {
+        use std::os::unix::net::UnixListener;
+
+        let host = format!("pm-probe-{}", std::process::id());
+        // Nothing bound yet -> not live.
+        assert!(!session_is_live_blocking(&host));
+
+        // A live listener on the per-host socket reads as live.
+        let path = socket_path(&host).unwrap();
+        let _ = std::fs::remove_file(&path); // clear any stale file from a prior run
+        let listener = UnixListener::bind(&path).unwrap();
+        assert!(session_is_live_blocking(&host));
+
+        // Once the listener is gone, the lingering socket file is not "live".
+        drop(listener);
+        assert!(!session_is_live_blocking(&host));
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn request_response_json_roundtrip() {
         let req = Request::Add {
@@ -450,6 +535,11 @@ mod tests {
             "8888",
             "192.168.4.2:8080->8080",
             "podman:web@10.88.0.5:5432->15432",
+            "8080->0.0.0.0:8080",
+            "podman:web@10.88.0.5:5432->0.0.0.0:15432",
+            "socks",
+            "socks->1080",
+            "podman:web@socks->9050",
         ] {
             let spec: ForwardSpec = raw.parse().unwrap();
             let shown = display_spec(&spec);
@@ -472,6 +562,7 @@ mod tests {
             local_addr: std::net::Ipv4Addr::LOCALHOST.into(),
             local_port: 45000,
             local_port_auto: true,
+            kind: Default::default(),
         };
         // Persisted form must be the short (preferred) form, not `->45000`.
         let shown = display_spec(&spec);

@@ -8,22 +8,35 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use portmanager::cli::{self, Cli, Command};
-use portmanager::client::ForwardSet;
+use portmanager::client::{ForwardSet, Origin};
 use portmanager::control::{self, Request, Response};
 use portmanager::forward::ForwardSpec;
 use portmanager::supervisor::{Status, Supervisor};
-use portmanager::{agent, config, crypto, discovery, doctor, netns};
+use portmanager::{agent, config, crypto, discovery, doctor, logbuf, netns, tui};
 
 const DAEMON_CHILD_ENV: &str = "PORTMANAGER_DAEMON_CHILD";
 
 fn main() -> Result<()> {
+    use std::io::IsTerminal;
+
     let cli = Cli::parse();
-    init_tracing(cli.verbose);
+
+    // Interactive TUI when launching a foreground session attached to a real
+    // terminal. Daemon, daemon-child, subcommands, and piped/CI invocations
+    // fall back to plain stderr logging. Decided before tracing init so the TUI
+    // can capture logs into its in-memory pane.
+    let tui_mode = cli.command.is_none()
+        && !cli.run.daemon
+        && std::env::var_os(DAEMON_CHILD_ENV).is_none()
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal();
+    let log_buf = tui_mode.then(logbuf::new_buffer);
+    init_tracing(cli.verbose, log_buf.clone());
     crypto::init();
 
     match cli.command {
@@ -31,6 +44,7 @@ fn main() -> Result<()> {
             &args.listen,
             Duration::from_secs(args.grace_secs),
             args.foreground,
+            args.tunnel,
         ),
         Some(Command::NsHelper) => netns::run_helper(),
         Some(cmd) => block_on(run_control_command(cmd)),
@@ -39,7 +53,7 @@ fn main() -> Result<()> {
                 spawn_daemon(&cli.run, cli.verbose)?;
                 Ok(())
             } else {
-                block_on(run_client(cli.run, cli.verbose))
+                block_on(run_client(cli.run, cli.verbose, log_buf))
             }
         }
     }
@@ -194,10 +208,15 @@ async fn run_logs(host: &str, follow: bool) -> Result<()> {
 
 /// Default action: bootstrap an agent on the host and serve the forward set
 /// under the never-give-up supervisor, with control socket + discovery.
-async fn run_client(args: cli::RunArgs, verbose: u8) -> Result<()> {
+async fn run_client(
+    args: cli::RunArgs,
+    verbose: u8,
+    log_buf: Option<logbuf::LogBuffer>,
+) -> Result<()> {
+    let tui_mode = log_buf.is_some();
     // Resolve host, initial forwards, rules, and the persistence target from
     // either a named profile or the per-host remembered state.
-    let (host, mut forwards, rules, persist) = if let Some(name) = &args.profile {
+    let (host, mut forwards, rules, persist, via_ssh) = if let Some(name) = &args.profile {
         let config = tokio::task::spawn_blocking(config::load_config).await??;
         let profile = config
             .profiles
@@ -207,14 +226,22 @@ async fn run_client(args: cli::RunArgs, verbose: u8) -> Result<()> {
         if host.is_empty() {
             bail!("profile {name:?} has no host and none was given on the CLI");
         }
-        let mut forwards =
-            parse_specs(&profile.forwards).with_context(|| format!("in profile {name:?}"))?;
-        forwards.extend(parse_specs(&args.specs)?);
+        let mut forwards: Vec<(ForwardSpec, Origin)> = parse_specs(&profile.forwards)
+            .with_context(|| format!("in profile {name:?}"))?
+            .into_iter()
+            .map(|s| (s, Origin::Remembered))
+            .collect();
+        forwards.extend(
+            parse_specs(&args.specs)?
+                .into_iter()
+                .map(|s| (s, Origin::UserAdded)),
+        );
         (
             host,
             forwards,
             profile.autoforward.clone(),
             config::PersistTarget::Profile { name: name.clone() },
+            args.via_ssh || profile.via_ssh,
         )
     } else {
         let host = args
@@ -225,20 +252,25 @@ async fn run_client(args: cli::RunArgs, verbose: u8) -> Result<()> {
             let host = host.clone();
             tokio::task::spawn_blocking(move || config::load_state(&host)).await??
         };
-        let mut forwards = parse_specs(&args.specs)?;
+        let mut forwards: Vec<(ForwardSpec, Origin)> = parse_specs(&args.specs)?
+            .into_iter()
+            .map(|s| (s, Origin::UserAdded))
+            .collect();
         for remembered in state.parsed_forwards() {
             if !forwards
                 .iter()
-                .any(|f| f.local_port == remembered.local_port)
+                .any(|(f, _)| f.local_port == remembered.local_port)
             {
-                forwards.push(remembered);
+                forwards.push((remembered, Origin::Remembered));
             }
         }
+        let via_ssh = args.via_ssh || state.via_ssh;
         (
             host.clone(),
             forwards,
             state.autoforward,
             config::PersistTarget::HostState { host },
+            via_ssh,
         )
     };
 
@@ -247,27 +279,61 @@ async fn run_client(args: cli::RunArgs, verbose: u8) -> Result<()> {
     // fall back instead of being discarded here.
     {
         let mut seen = std::collections::HashSet::new();
-        forwards.retain(|f| seen.insert((f.ns.to_wire(), f.remote_host.clone(), f.remote_port)));
+        forwards
+            .retain(|(f, _)| seen.insert((f.ns.to_wire(), f.remote_host.clone(), f.remote_port)));
     }
-    if forwards.is_empty() && rules.is_empty() {
-        bail!(
-            "no forwards given and none remembered for {host:?}; pass at least one spec \
-             (e.g. 8888 or 192.168.4.2:8080->8080)"
+    // An empty session is valid: the TUI comes up empty and you add forwards
+    // interactively, and a daemon can be populated later via `add`. Only the
+    // non-interactive, non-daemon foreground path has nothing useful to do
+    // empty — warn rather than fail.
+    if forwards.is_empty() && rules.is_empty() && !tui_mode && !args.daemon {
+        warn!(
+            "no forwards given and none remembered for {host:?}; \
+             session will sit idle (add some with `portmanager add {host} <spec>`)"
         );
     }
 
-    let supervisor = Supervisor::start(host.clone(), args.remote_udp.clone(), verbose)
-        .await
-        .map_err(|e| {
-            e.context(
-                "session bootstrap failed — note the remote must allow inbound UDP \
-                 (not just SSH/22) for the QUIC channel",
-            )
-        })?;
+    // Refuse a second session for the same host on this machine: the control
+    // socket is per-host, so a second launch couldn't be managed and would only
+    // bootstrap a redundant (leaked) agent. Fail fast, before bootstrapping.
+    if control::session_is_live(&host).await {
+        bail!(
+            "a portmanager session for {host:?} is already running on this machine — \
+             manage it with `portmanager list|add|stop {host}`, or stop it first"
+        );
+    }
+
+    // Remember the tunnel choice so a later plain `portmanager <host>` keeps it.
+    if via_ssh && let config::PersistTarget::HostState { host } = &persist {
+        let host = host.clone();
+        let _ = tokio::task::spawn_blocking(move || config::remember_via_ssh(&host)).await;
+    }
+
+    let supervisor = Supervisor::start(
+        host.clone(),
+        args.remote_udp.clone(),
+        verbose,
+        args.agent_grace.as_secs(),
+        via_ssh,
+    )
+    .await
+    .map_err(|e| {
+        // The UDP-failure path attaches its own options message at the source
+        // (firewall::udp_failure_message); other bootstrap errors (ssh/arch) are
+        // self-describing. Only the tunnel path needs a top-level hint here.
+        if via_ssh {
+            e.context("session bootstrap failed over the SSH tunnel")
+        } else {
+            e
+        }
+    })?;
 
     let forward_set = Arc::new(ForwardSet::new(supervisor.slot.clone()));
-    for forward in forwards {
-        forward_set.add(forward).await.context("binding forward")?;
+    for (forward, origin) in forwards {
+        forward_set
+            .add(forward, origin)
+            .await
+            .context("binding forward")?;
     }
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
@@ -282,13 +348,35 @@ async fn run_client(args: cli::RunArgs, verbose: u8) -> Result<()> {
         persist,
     }));
 
-    // Discovery: auto-forward rule matching (no-op without rules).
+    // In TUI mode, discovery runs to enrich the table with each forward's
+    // remote process; otherwise it only matters for auto-forward rules.
+    let discovery_tx = tui_mode.then(|| watch::channel(Vec::new()));
+    let snapshot_rx = discovery_tx.as_ref().map(|(_, rx)| rx.clone());
     tokio::spawn(discovery::watch(
         host.clone(),
         supervisor.slot.clone(),
         forward_set.clone(),
         rules,
+        discovery_tx.map(|(tx, _)| tx),
     ));
+
+    if let Some(log_buf) = log_buf {
+        // Interactive TUI: drive it until the user quits or the session stops.
+        let result = tui::run(
+            host.clone(),
+            forward_set.clone(),
+            supervisor.status.clone(),
+            supervisor.agent_version.clone(),
+            log_buf,
+            snapshot_rx.expect("tui mode always has a discovery snapshot channel"),
+            shutdown_rx,
+        )
+        .await;
+        control_task.abort();
+        control::cleanup(&host);
+        supervisor.shutdown().await;
+        return result;
+    }
 
     // Mosh-style status: announce transitions until Ctrl-C.
     let mut status = supervisor.status.clone();
@@ -332,6 +420,14 @@ fn spawn_daemon(args: &cli::RunArgs, verbose: u8) -> Result<()> {
     use std::process::Stdio;
 
     let host = daemon_host(args)?;
+    // Fast-fail before forking a redundant daemon (which would bootstrap a
+    // leaked agent and never own the per-host control socket).
+    if control::session_is_live_blocking(&host) {
+        bail!(
+            "a portmanager session for {host:?} is already running on this machine — \
+             manage it with `portmanager list|add|stop {host}`, or stop it first"
+        );
+    }
     let exe = std::env::current_exe().context("resolving current executable")?;
     let log_dir = directories::BaseDirs::new()
         .map(|d| d.cache_dir().join("portmanager"))
@@ -495,7 +591,7 @@ fn parse_specs(specs: &[String]) -> Result<Vec<ForwardSpec>> {
         .collect()
 }
 
-fn init_tracing(verbose: u8) {
+fn init_tracing(verbose: u8, log_buf: Option<logbuf::LogBuffer>) {
     let default = match verbose {
         0 => "info",
         1 => "debug",
@@ -503,10 +599,17 @@ fn init_tracing(verbose: u8) {
     };
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("portmanager={default}")));
-    // Always log to stderr: stdout is reserved for the bootstrap handshake line.
-    tracing_subscriber::fmt()
+    let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
+        .with_target(false);
+    // In TUI mode the terminal owns stderr, so route logs into the in-memory
+    // ring buffer the TUI renders (no ANSI). Otherwise log to stderr: stdout is
+    // reserved for the agent's bootstrap handshake line (client never uses it).
+    match log_buf {
+        Some(buf) => builder
+            .with_ansi(false)
+            .with_writer(logbuf::MakeLogWriter::new(buf))
+            .init(),
+        None => builder.with_writer(std::io::stderr).init(),
+    }
 }

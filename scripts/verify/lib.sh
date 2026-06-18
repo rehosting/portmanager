@@ -177,6 +177,46 @@ REMOTE
 # ---------------------------------------------------------------------------
 pm() { "$PM_BIN" "$@"; }
 
+# Path the daemon writes its log to, per platform (the `directories` crate uses
+# the OS cache dir: ~/Library/Caches on macOS, $XDG_CACHE_HOME/~/.cache on Linux).
+client_log_path() {
+    if [[ "$(uname -s)" == Darwin ]]; then
+        echo "$HOME/Library/Caches/portmanager/client.log"
+    else
+        echo "${XDG_CACHE_HOME:-$HOME/.cache}/portmanager/client.log"
+    fi
+}
+
+# Whether the latest launch failure was the direct QUIC path failing to reach the
+# agent's UDP listener (a UDP-filtered remote — firewall or cloud security group).
+_udp_listener_unreachable() {
+    grep -qiE 'inbound UDP may be blocked|QUIC handshake timed out|could not reach the agent' \
+        "$(client_log_path)" 2>/dev/null
+}
+
+# Launch a daemon session, falling back to the SSH tunnel on UDP-blocked hosts.
+launch_session() { # spec...
+    # The ${arr[@]+"${arr[@]}"} idiom expands to nothing when the array is empty,
+    # avoiding the "unbound variable" error set -u raises in bash 3.2 (macOS).
+    if pm --daemon ${PM_LAUNCH_ARGS[@]+"${PM_LAUNCH_ARGS[@]}"} "$HOST" "$@"; then
+        return 0
+    fi
+    # Direct QUIC needs inbound UDP on the remote. If that's what failed and we
+    # weren't already tunneling, retry over the SSH tunnel so the suite stays
+    # meaningful on UDP-restricted hosts (e.g. LLGrid, locked-down clouds).
+    if [[ "$PM_LAUNCH_ARGS_RAW" != *--via-ssh* ]] && _udp_listener_unreachable; then
+        info "direct QUIC blocked (remote UDP filtered); retrying over --via-ssh"
+        pm stop "$HOST" >/dev/null 2>&1 || true
+        pm forget "$HOST" >/dev/null 2>&1 || true
+        if pm --daemon --via-ssh ${PM_LAUNCH_ARGS[@]+"${PM_LAUNCH_ARGS[@]}"} "$HOST" "$@"; then
+            info "session is using the SSH-tunnel transport"
+            return 0
+        fi
+        skip "remote blocks inbound UDP and the --via-ssh fallback was unavailable (rerun with PM_LAUNCH_ARGS=--via-ssh on a build that supports it)"
+    fi
+    return 1
+}
+
 # Start a background daemon session forwarding the seed spec(s). Registers a
 # stop + cleanup. Best-effort stops any pre-existing session for $HOST first.
 pm_start_session() { # spec...
@@ -186,11 +226,9 @@ pm_start_session() { # spec...
     # previous run (a plain `portmanager <host>` resumes persisted state).
     pm forget "$HOST" >/dev/null 2>&1 || true
     info "starting session: $HOST $* $PM_LAUNCH_ARGS_RAW"
-    # The ${arr[@]+"${arr[@]}"} idiom expands to nothing when the array is empty,
-    # avoiding the "unbound variable" error set -u raises in bash 3.2 (macOS).
-    if ! pm --daemon ${PM_LAUNCH_ARGS[@]+"${PM_LAUNCH_ARGS[@]}"} "$HOST" "$@"; then
+    if ! launch_session "$@"; then
         echo "error: failed to start session; recent client log:" >&2
-        local log="${XDG_CACHE_HOME:-$HOME/.cache}/portmanager/client.log"
+        local log; log="$(client_log_path)"
         [[ -f "$log" ]] && tail -n 20 "$log" >&2
         exit 1
     fi
@@ -220,4 +258,45 @@ pm_local_port_for() { # remote_port
 # Fetch http://127.0.0.1:<port>/token.txt (short timeout); echoes the body.
 fetch_token() { # local_port
     curl -fsS --max-time 5 "http://127.0.0.1:$1/token.txt"
+}
+
+# Whether the local curl understands SOCKS5 options. An unknown option makes
+# curl exit 2 (init/option error); a real connection problem to the closed probe
+# port exits with something else (e.g. 7). So "didn't exit 2" => supported.
+curl_supports_socks() {
+    curl --socks5 127.0.0.1:1 -s -o /dev/null --max-time 2 "http://127.0.0.1:1/" \
+        >/dev/null 2>&1
+    [[ $? -ne 2 ]]
+}
+
+# Echo the bound local port of the SOCKS forward, parsed from `pm list`. A SOCKS
+# entry's spec column is `[ns@]socks[->PORT]`; strip the `->LOCAL` suffix and any
+# `ns@` prefix, and when what's left is exactly `socks`, print its local port
+# (the first column's `addr:port`).
+pm_socks_local_port() {
+    local out
+    out="$(pm list "$HOST" | awk '
+        {
+            spec = $2
+            sub(/->.*/, "", spec)          # drop ->LOCAL
+            sub(/^.*@/, "", spec)          # drop NS@ prefix
+            if (spec == "socks") {
+                m = split($1, b, ":")      # local addr:port
+                print b[m]
+            }
+        }')"
+    [[ -n "$out" ]] || return 1
+    echo "$out"
+}
+
+# Fetch token.txt through a local SOCKS5 proxy.
+#   $1 proxy local port
+#   $2 target host (as the agent dials it)
+#   $3 target port
+#   $4 resolve mode: "remote" (default; hostname sent to the agent, resolved on
+#      the remote) or "local" (curl resolves before connecting)
+fetch_token_socks() { # proxy_port target_host target_port [remote|local]
+    local flag=--socks5-hostname
+    [[ "${4:-remote}" == local ]] && flag=--socks5
+    curl -fsS --max-time 5 "$flag" "127.0.0.1:$1" "http://$2:$3/token.txt"
 }

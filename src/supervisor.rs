@@ -23,6 +23,7 @@
 //! copying its secrets) is unsupported and undefined.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -33,8 +34,11 @@ use tracing::{info, warn};
 use crate::agent::CLOSE_SHUTDOWN;
 use crate::bootstrap::{self, AgentSession};
 use crate::client::ConnSlot;
+use crate::conn::{Conn, SshConn};
 use crate::crypto::{self, Timing};
 use crate::firewall::{self, AdvisePort};
+use crate::handshake::Token;
+use crate::tunnel::SshTunnel;
 use crate::{client, netwatch, transport};
 
 /// Per-attempt QUIC handshake timeout during recovery.
@@ -73,12 +77,21 @@ impl Supervisor {
     /// connection is up (so callers can bind forwards immediately).
     ///
     /// `verbose` is the client's `-v` count, threaded to the remote agent.
-    pub async fn start(host: String, listen: Option<String>, verbose: u8) -> Result<Self> {
+    pub async fn start(
+        host: String,
+        listen: Option<String>,
+        verbose: u8,
+        grace_secs: u64,
+        via_ssh: bool,
+    ) -> Result<Self> {
+        if via_ssh {
+            return Self::start_tunnel(host, verbose, grace_secs).await;
+        }
         let timing = Timing::default();
 
         let (status_tx, status_rx) = watch::channel(Status::Bootstrapping);
         info!(%host, "bootstrapping agent over SSH");
-        let session = bootstrap_agent(&host, listen.as_deref(), verbose).await?;
+        let session = bootstrap_agent(&host, listen.as_deref(), verbose, grace_secs).await?;
         let addr = resolve(&session.quic_target).await?;
         let (version_tx, version_rx) = watch::channel(session.agent_version.clone());
 
@@ -90,26 +103,20 @@ impl Supervisor {
         let conn = match connect_once(&endpoint, client_cfg.clone(), addr).await {
             Ok(conn) => conn,
             Err(e) => {
-                // Inbound UDP blocked is the most common cause: diagnose the
-                // remote firewall over the SSH channel and show how to open it.
-                let advisory = firewall::diagnose(&host, advise_port(listen.as_deref())).await;
-                warn!(
-                    "could not reach the agent's UDP listener — inbound UDP may be blocked.\n{advisory}"
-                );
-                return Err(e).with_context(|| {
-                    format!(
-                        "connecting to agent UDP listener at {} ({addr}); open/forward this UDP \
-                         port on the remote, or choose an allowed port with \
-                         --remote-udp 0.0.0.0:<PORT>",
-                        session.quic_target
-                    )
-                });
+                // Inbound UDP blocked is the most common cause. Attach a clear,
+                // user-facing message laying out the options (open UDP /
+                // --remote-udp / --via-ssh) to the *error* — not just a log line
+                // — so it's visible in every mode, including a TUI launch that
+                // aborts before the TUI (and its log pane) ever appears.
+                let options =
+                    firewall::udp_failure_message(&host, advise_port(listen.as_deref())).await;
+                return Err(e).context(options);
             }
         };
         info!(target = %session.quic_target, "connected to agent");
         status_tx.send_replace(Status::Connected);
 
-        let (slot_tx, slot_rx) = client::conn_slot(Some(conn.clone()));
+        let (slot_tx, slot_rx) = client::conn_slot(Some(Conn::Quic(conn.clone())));
         let (target_tx, target_rx) = watch::channel(addr);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -120,6 +127,7 @@ impl Supervisor {
             host,
             listen,
             verbose,
+            grace_secs,
             endpoint,
             timing,
             session,
@@ -142,12 +150,61 @@ impl Supervisor {
         })
     }
 
+    /// SSH-tunnel variant of [`Supervisor::start`]: bootstrap a `--tunnel` agent,
+    /// stand up the `ssh -L` forward, and connect over it. Used for hosts with no
+    /// direct UDP path (reached only through a jump host).
+    async fn start_tunnel(host: String, verbose: u8, grace_secs: u64) -> Result<Self> {
+        let (status_tx, status_rx) = watch::channel(Status::Bootstrapping);
+        info!(%host, "bootstrapping tunnel agent over SSH");
+        let session = bootstrap::bootstrap_tunnel(&host, verbose, grace_secs).await?;
+        let (version_tx, version_rx) = watch::channel(session.agent_version.clone());
+
+        let tunnel = SshTunnel::spawn(&host, session.tcp_port)
+            .await
+            .context("setting up the ssh -L data tunnel")?;
+        let conn = SshConn::connect(tunnel.local, session.token.clone())
+            .await
+            .context("connecting through the ssh -L tunnel")?;
+        info!(
+            port = session.tcp_port,
+            "connected to agent over ssh tunnel"
+        );
+        status_tx.send_replace(Status::Connected);
+
+        let (slot_tx, slot_rx) = client::conn_slot(Some(Conn::Ssh(conn.clone())));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let monitor = tokio::spawn(monitor_loop_tunnel(TunnelCtx {
+            host,
+            verbose,
+            grace_secs,
+            tcp_port: session.tcp_port,
+            token: session.token,
+            tunnel,
+            conn,
+            slot_tx,
+            status_tx,
+            version_tx,
+            shutdown_rx,
+        }));
+
+        Ok(Supervisor {
+            slot: slot_rx,
+            status: status_rx,
+            agent_version: version_rx,
+            shutdown_tx,
+            monitor,
+        })
+    }
+
     /// Graceful shutdown: tell the agent to exit now (rather than waiting out
     /// its grace window) and stop supervising.
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
-        // Give the monitor a moment to deliver the close, then stop it.
-        let _ = tokio::time::timeout(Duration::from_secs(2), self.monitor).await;
+        // Give the monitor time to deliver the close — for the SSH tunnel this
+        // includes waiting for the agent to ack the shutdown opcode (see
+        // SshConn::send_shutdown), so the budget must exceed that ack timeout.
+        let _ = tokio::time::timeout(Duration::from_secs(6), self.monitor).await;
     }
 }
 
@@ -155,14 +212,37 @@ struct MonitorCtx {
     host: String,
     listen: Option<String>,
     verbose: u8,
+    /// Grace window (seconds) handed to the agent on every (re-)bootstrap.
+    grace_secs: u64,
     endpoint: Endpoint,
     timing: Timing,
     session: AgentSession,
     client_cfg: quinn::ClientConfig,
     addr: SocketAddr,
     conn: Connection,
-    slot_tx: watch::Sender<Option<Connection>>,
+    slot_tx: watch::Sender<Option<Conn>>,
     target_tx: watch::Sender<SocketAddr>,
+    status_tx: watch::Sender<Status>,
+    version_tx: watch::Sender<String>,
+    shutdown_rx: watch::Receiver<bool>,
+}
+
+/// State for the SSH-tunnel monitor loop. The agent daemon persists across SSH
+/// death (grace window), so recovery means re-standing the `ssh -L` forward and
+/// reconnecting to the same agent; only after a cycle do we re-bootstrap.
+struct TunnelCtx {
+    host: String,
+    verbose: u8,
+    grace_secs: u64,
+    /// Agent loopback port; updated on re-bootstrap.
+    tcp_port: u16,
+    /// Session token; updated on re-bootstrap.
+    token: Token,
+    /// Held to keep the forward alive; replaced (old one dropped/killed) on
+    /// reconnect.
+    tunnel: SshTunnel,
+    conn: Arc<SshConn>,
+    slot_tx: watch::Sender<Option<Conn>>,
     status_tx: watch::Sender<Status>,
     version_tx: watch::Sender<String>,
     shutdown_rx: watch::Receiver<bool>,
@@ -239,7 +319,14 @@ async fn monitor_loop(mut ctx: MonitorCtx) {
             if attempt.is_multiple_of(REATTACH_ATTEMPTS_PER_CYCLE) {
                 ctx.status_tx.send_replace(Status::Bootstrapping);
                 info!("re-bootstrapping agent over SSH");
-                match bootstrap_agent(&ctx.host, ctx.listen.as_deref(), ctx.verbose).await {
+                match bootstrap_agent(
+                    &ctx.host,
+                    ctx.listen.as_deref(),
+                    ctx.verbose,
+                    ctx.grace_secs,
+                )
+                .await
+                {
                     Ok(session) => match resolve(&session.quic_target).await {
                         Ok(addr) => {
                             match crypto::client_config(
@@ -282,10 +369,95 @@ async fn monitor_loop(mut ctx: MonitorCtx) {
         };
 
         ctx.conn = conn.clone();
-        ctx.slot_tx.send_replace(Some(conn));
+        ctx.slot_tx.send_replace(Some(Conn::Quic(conn)));
         ctx.status_tx.send_replace(Status::Connected);
         info!("session restored");
     }
+}
+
+/// The SSH-tunnel monitor loop: watch the keepalive connection (which also dies
+/// when the `ssh -L` process dies), and on loss respawn the forward + reconnect,
+/// escalating to a re-bootstrap after a cycle. Never gives up.
+async fn monitor_loop_tunnel(mut ctx: TunnelCtx) {
+    loop {
+        let mut shutdown_rx = ctx.shutdown_rx.clone();
+        let died = tokio::select! {
+            _ = ctx.conn.wait_closed() => true,
+            _ = wait_shutdown(&mut shutdown_rx) => false,
+        };
+        if !died {
+            info!("closing session");
+            ctx.conn.send_shutdown().await;
+            return;
+        }
+        warn!("tunnel connection lost; recovering");
+        ctx.slot_tx.send_replace(None);
+
+        let mut attempt: u32 = 0;
+        let (tunnel, conn) = 'recover: loop {
+            if *ctx.shutdown_rx.borrow() {
+                return;
+            }
+            attempt += 1;
+            ctx.status_tx.send_replace(Status::Reconnecting { attempt });
+
+            // Re-attach: respawn the forward and reconnect to the (still-alive)
+            // agent with the same port + token.
+            match try_tunnel_connect(&ctx.host, ctx.tcp_port, &ctx.token).await {
+                Ok(pair) => {
+                    info!(attempt, "re-attached over ssh tunnel");
+                    break 'recover pair;
+                }
+                Err(e) => info!(attempt, error = %e, "tunnel re-attach failed"),
+            }
+
+            // Re-bootstrap: after a cycle of failures, assume the agent is gone.
+            if attempt.is_multiple_of(REATTACH_ATTEMPTS_PER_CYCLE) {
+                ctx.status_tx.send_replace(Status::Bootstrapping);
+                info!("re-bootstrapping tunnel agent over SSH");
+                match bootstrap::bootstrap_tunnel(&ctx.host, ctx.verbose, ctx.grace_secs).await {
+                    Ok(session) => {
+                        ctx.version_tx.send_replace(session.agent_version.clone());
+                        ctx.tcp_port = session.tcp_port;
+                        ctx.token = session.token.clone();
+                        match try_tunnel_connect(&ctx.host, ctx.tcp_port, &ctx.token).await {
+                            Ok(pair) => {
+                                info!("re-bootstrapped and connected over ssh tunnel");
+                                break 'recover pair;
+                            }
+                            Err(e) => info!(error = %e, "connect after re-bootstrap failed"),
+                        }
+                    }
+                    Err(e) => info!(error = %e, "tunnel re-bootstrap failed (will keep trying)"),
+                }
+            }
+
+            let delay = backoff_delay(attempt);
+            let mut shutdown_rx = ctx.shutdown_rx.clone();
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = wait_shutdown(&mut shutdown_rx) => return,
+            }
+        };
+
+        // Installing the new tunnel drops the old one (killing its ssh process).
+        ctx.tunnel = tunnel;
+        ctx.conn = conn.clone();
+        ctx.slot_tx.send_replace(Some(Conn::Ssh(conn)));
+        ctx.status_tx.send_replace(Status::Connected);
+        info!("session restored");
+    }
+}
+
+/// Stand up a fresh `ssh -L` forward and connect through it to the agent.
+async fn try_tunnel_connect(
+    host: &str,
+    tcp_port: u16,
+    token: &Token,
+) -> Result<(SshTunnel, Arc<SshConn>)> {
+    let tunnel = SshTunnel::spawn(host, tcp_port).await?;
+    let conn = SshConn::connect(tunnel.local, token.clone()).await?;
+    Ok((tunnel, conn))
 }
 
 /// Which UDP port (or the default range) to advise opening when the connect
@@ -301,15 +473,20 @@ fn advise_port(listen: Option<&str>) -> AdvisePort {
         ))
 }
 
-async fn bootstrap_agent(host: &str, listen: Option<&str>, verbose: u8) -> Result<AgentSession> {
+async fn bootstrap_agent(
+    host: &str,
+    listen: Option<&str>,
+    verbose: u8,
+    grace_secs: u64,
+) -> Result<AgentSession> {
     if let Some(listen) = listen {
-        return bootstrap::bootstrap(host, listen, verbose).await;
+        return bootstrap::bootstrap(host, listen, verbose, grace_secs).await;
     }
 
     let mut last_err = None;
     for port in DEFAULT_UDP_PORT_START..=DEFAULT_UDP_PORT_END {
         let listen = format!("0.0.0.0:{port}");
-        match bootstrap::bootstrap(host, &listen, verbose).await {
+        match bootstrap::bootstrap(host, &listen, verbose, grace_secs).await {
             Ok(session) => return Ok(session),
             Err(e) => last_err = Some(e),
         }

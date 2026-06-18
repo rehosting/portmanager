@@ -38,14 +38,53 @@ pub struct RunArgs {
     #[arg(short, long)]
     pub profile: Option<String>,
 
-    /// Start the local forwarding client in the background.
-    #[arg(long)]
+    /// Start the local forwarding client in the background (no TUI).
+    #[arg(short = 'd', long)]
     pub daemon: bool,
 
     /// UDP address the remote agent should bind. Defaults to the mosh-style
     /// 60000-61000 range; use this to force one specific allowed port.
     #[arg(long)]
     pub remote_udp: Option<String>,
+
+    /// Carry the data plane over SSH (`ssh -L`) instead of a direct QUIC/UDP
+    /// channel. Use for hosts reachable only through a jump host (ProxyJump)
+    /// with no direct UDP path. Remembered per host once used.
+    #[arg(long)]
+    pub via_ssh: bool,
+
+    /// How long the remote agent keeps the session alive after the last client
+    /// disconnects, before self-reaping (the re-attach window for roaming /
+    /// sleeping clients). Accepts `30s`, `15m`, `12h`, `2d` — a bare number is
+    /// seconds.
+    #[arg(long, value_parser = parse_grace, default_value = "12h")]
+    pub agent_grace: std::time::Duration,
+}
+
+/// Parse a human duration like `30s`, `15m`, `12h`, `2d` into a [`Duration`].
+/// A bare number is seconds. Used for `--agent-grace`.
+fn parse_grace(s: &str) -> Result<std::time::Duration, String> {
+    let s = s.trim();
+    let last = s.chars().last().ok_or("empty duration")?;
+    let (digits, unit_secs) = match last {
+        's' => (&s[..s.len() - 1], 1u64),
+        'm' => (&s[..s.len() - 1], 60),
+        'h' => (&s[..s.len() - 1], 3600),
+        'd' => (&s[..s.len() - 1], 86400),
+        c if c.is_ascii_digit() => (s, 1),
+        other => {
+            return Err(format!(
+                "unknown duration unit {other:?}; use s, m, h, or d"
+            ));
+        }
+    };
+    let n: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid duration {s:?}: {e}"))?;
+    n.checked_mul(unit_secs)
+        .map(std::time::Duration::from_secs)
+        .ok_or_else(|| format!("duration {s:?} is too large"))
 }
 
 #[derive(Debug, Subcommand)]
@@ -130,4 +169,44 @@ pub struct AgentArgs {
     /// daemonizing (used by tests and for debugging).
     #[arg(long)]
     pub foreground: bool,
+
+    /// Serve the SSH-tunnel transport: listen on a loopback TCP port (carried by
+    /// the client's `ssh -L`) instead of a QUIC/UDP listener. Set automatically
+    /// by the client's bootstrap; not for manual use.
+    #[arg(long)]
+    pub tunnel: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn verify_cli() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn parse_grace_units() {
+        assert_eq!(parse_grace("90").unwrap().as_secs(), 90);
+        assert_eq!(parse_grace("45s").unwrap().as_secs(), 45);
+        assert_eq!(parse_grace("15m").unwrap().as_secs(), 900);
+        assert_eq!(parse_grace("12h").unwrap().as_secs(), 43_200);
+        assert_eq!(parse_grace("2d").unwrap().as_secs(), 172_800);
+        assert_eq!(parse_grace(" 1h ").unwrap().as_secs(), 3_600);
+    }
+
+    #[test]
+    fn parse_grace_rejects_bad_input() {
+        assert!(parse_grace("").is_err());
+        assert!(parse_grace("12x").is_err());
+        assert!(parse_grace("abc").is_err());
+    }
+
+    #[test]
+    fn default_agent_grace_is_12h() {
+        let cli = Cli::try_parse_from(["portmanager", "myhost", "8888"]).unwrap();
+        assert_eq!(cli.run.agent_grace.as_secs(), 43_200);
+    }
 }

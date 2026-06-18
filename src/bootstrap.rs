@@ -128,8 +128,14 @@ pub(crate) fn agent_binary_for(triple: &str, remote_arch: &str) -> Result<std::p
 /// Bootstrap an agent on `host` listening on `listen` (a UDP bind spec).
 ///
 /// `verbose` is the client's `-v` count, threaded to the agent so remote logs
-/// match the requested verbosity.
-pub async fn bootstrap(host: &str, listen: &str, verbose: u8) -> Result<AgentSession> {
+/// match the requested verbosity. `grace_secs` is how long the agent holds the
+/// session open after the last client disconnects before self-reaping.
+pub async fn bootstrap(
+    host: &str,
+    listen: &str,
+    verbose: u8,
+    grace_secs: u64,
+) -> Result<AgentSession> {
     let hostname = ssh_hostname(host).await?;
 
     let uname = ssh_capture(host, &["uname", "-sm"])
@@ -157,7 +163,9 @@ pub async fn bootstrap(host: &str, listen: &str, verbose: u8) -> Result<AgentSes
         .arg(&remote_path)
         .arg("agent")
         .arg("--listen")
-        .arg(listen);
+        .arg(listen)
+        .arg("--grace-secs")
+        .arg(grace_secs.to_string());
     for _ in 0..verbose {
         cmd.arg("-v");
     }
@@ -194,6 +202,83 @@ pub async fn bootstrap(host: &str, listen: &str, verbose: u8) -> Result<AgentSes
         agent_fp: ready.agent_fp,
         client_id,
         session_id: ready.session_id,
+        token,
+        agent_version: ready.version,
+    })
+}
+
+/// Everything the client needs to reach a tunnel-mode agent: the agent's
+/// loopback TCP port (forwarded by `ssh -L`) and the session token gating it.
+pub struct TunnelSession {
+    /// Loopback TCP port the agent listens on (the `ssh -L` forward target).
+    pub tcp_port: u16,
+    /// Shared session secret presented on every tunnel connection.
+    pub token: Token,
+    /// Agent binary version reported in the handshake (skew detection).
+    pub agent_version: String,
+}
+
+/// Bootstrap a tunnel-mode agent on `host`: deploy the binary, launch it with
+/// `--tunnel` (loopback TCP listener, no QUIC/UDP), and complete the handshake
+/// over the SSH pipe. The data plane is carried later by `ssh -L` (see
+/// [`crate::tunnel`]); this only establishes the agent and its token.
+pub async fn bootstrap_tunnel(host: &str, verbose: u8, grace_secs: u64) -> Result<TunnelSession> {
+    let uname = ssh_capture(host, &["uname", "-sm"])
+        .await
+        .context("detecting remote OS/arch")?;
+    let triple = target_triple(uname.trim())?;
+    let remote_arch = uname.split_whitespace().nth(1).unwrap_or_default();
+
+    let exe = agent_binary_for(triple, remote_arch)?;
+    let remote_path = deploy_agent(host, &exe, triple).await?;
+    reap_stale_agents(host, env!("CARGO_PKG_VERSION")).await;
+
+    let client_id = Identity::generate()?;
+    let token = Token::random()?;
+
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o")
+        .arg(SSH_CONNECT_TIMEOUT)
+        .arg(host)
+        .arg(&remote_path)
+        .arg("agent")
+        .arg("--listen")
+        .arg("127.0.0.1:0")
+        .arg("--tunnel")
+        .arg("--grace-secs")
+        .arg(grace_secs.to_string());
+    for _ in 0..verbose {
+        cmd.arg("-v");
+    }
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("launching tunnel agent over SSH")?;
+
+    let mut stdin = child.stdin.take().context("agent stdin unavailable")?;
+    let stdout = child.stdout.take().context("agent stdout unavailable")?;
+    let mut reader = BufReader::new(stdout);
+
+    Hello {
+        client_fp: client_id.fingerprint,
+        token: token.clone(),
+    }
+    .write(&mut stdin)
+    .await
+    .context("sending handshake")?;
+
+    let ready = Ready::read(&mut reader)
+        .await
+        .context("agent did not complete handshake")?;
+
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+
+    Ok(TunnelSession {
+        tcp_port: ready.udp_port,
         token,
         agent_version: ready.version,
     })

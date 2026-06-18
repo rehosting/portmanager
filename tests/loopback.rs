@@ -57,7 +57,7 @@ async fn forwards_bytes_end_to_end() {
     let client_ep = transport::client_endpoint(client_cfg).unwrap();
     let conn = transport::connect(&client_ep, agent_addr).await.unwrap();
 
-    let (_slot_tx, slot_rx) = client::conn_slot(Some(conn));
+    let (_slot_tx, slot_rx) = client::conn_slot(Some(portmanager::conn::Conn::Quic(conn)));
     let forward = ForwardSpec {
         ns: NsSpec::Host,
         remote_host: echo_addr.ip().to_string(),
@@ -65,6 +65,7 @@ async fn forwards_bytes_end_to_end() {
         local_addr: Ipv4Addr::LOCALHOST.into(),
         local_port: 0,
         local_port_auto: false,
+        kind: Default::default(),
     };
     let (local_addr, _task) = client::bind_forward(slot_rx, forward, client::new_health_handle())
         .await
@@ -117,7 +118,7 @@ async fn listener_survives_reconnect() {
     let client_ep = transport::client_endpoint(client_cfg).unwrap();
     let conn1 = transport::connect(&client_ep, agent_addr).await.unwrap();
 
-    let (slot_tx, slot_rx) = client::conn_slot(Some(conn1.clone()));
+    let (slot_tx, slot_rx) = client::conn_slot(Some(portmanager::conn::Conn::Quic(conn1.clone())));
     let forward = ForwardSpec {
         ns: NsSpec::Host,
         remote_host: echo_addr.ip().to_string(),
@@ -125,6 +126,7 @@ async fn listener_survives_reconnect() {
         local_addr: Ipv4Addr::LOCALHOST.into(),
         local_port: 0,
         local_port_auto: false,
+        kind: Default::default(),
     };
     let (local_addr, _task) = client::bind_forward(slot_rx, forward, client::new_health_handle())
         .await
@@ -154,7 +156,7 @@ async fn listener_survives_reconnect() {
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     let conn2 = transport::connect(&client_ep, agent_addr).await.unwrap();
-    slot_tx.send_replace(Some(conn2));
+    slot_tx.send_replace(Some(portmanager::conn::Conn::Quic(conn2)));
 
     let buf = pending.await.unwrap();
     assert_eq!(&buf, b"after-outage!", "traffic must flow after re-attach");
