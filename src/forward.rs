@@ -227,6 +227,111 @@ impl FromStr for ForwardSpec {
     }
 }
 
+/// One fully-parsed reverse port forward (the `ssh -R` equivalent).
+///
+/// The data direction is the inverse of [`ForwardSpec`]: the **agent** binds a
+/// listener on the remote host, and each connection accepted there is dialed by
+/// the **client** to a local target. Grammar:
+///
+/// ```text
+/// [NS@]REMOTEBIND->LOCALTARGET
+///   REMOTEBIND  = [BINDADDR:]PORT   ; the agent binds this remotely (default 127.0.0.1)
+///   LOCALTARGET = [HOST:]PORT       ; the client dials this locally (default host 127.0.0.1)
+/// ```
+///
+/// Examples:
+/// - `3000->3000`                     -> agent binds remote 127.0.0.1:3000, client dials 127.0.0.1:3000
+/// - `0.0.0.0:8080->192.168.1.5:80`   -> agent binds remote *:8080, client dials a LAN host
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReverseSpec {
+    /// Namespace the agent binds the remote listener in. v1 supports
+    /// [`NsSpec::Host`] only.
+    pub ns: NsSpec,
+    /// Address the agent binds on the remote host. Defaults to loopback.
+    pub remote_bind_addr: IpAddr,
+    /// Port the agent binds on the remote host. Strict (no fallback).
+    pub remote_bind_port: u16,
+    /// Host the client dials locally for each accepted remote connection.
+    pub local_host: String,
+    /// Port the client dials locally.
+    pub local_port: u16,
+}
+
+impl ReverseSpec {
+    /// A stable key identifying this reverse forward by its remote bind endpoint
+    /// (plus namespace). Used for dedup and `drop`-by-spec.
+    pub fn bind_key(&self) -> (String, IpAddr, u16) {
+        (
+            self.ns.to_wire(),
+            self.remote_bind_addr,
+            self.remote_bind_port,
+        )
+    }
+
+    /// Canonical CLI-grammar rendering (parseable back via [`FromStr`]). Elides
+    /// a loopback bind address and a `127.0.0.1` local host so the short forms
+    /// round-trip.
+    pub fn to_spec_string(&self) -> String {
+        let ns = self.ns.to_wire();
+        let prefix = if ns.is_empty() {
+            String::new()
+        } else {
+            format!("{ns}@")
+        };
+        let bind = if self.remote_bind_addr == ForwardSpec::DEFAULT_LOCAL_ADDR {
+            self.remote_bind_port.to_string()
+        } else {
+            match self.remote_bind_addr {
+                IpAddr::V4(v4) => format!("{v4}:{}", self.remote_bind_port),
+                IpAddr::V6(v6) => format!("[{v6}]:{}", self.remote_bind_port),
+            }
+        };
+        let local = if self.local_host == ForwardSpec::DEFAULT_REMOTE_HOST {
+            self.local_port.to_string()
+        } else if self.local_host.contains(':') {
+            // Bare IPv6 literal needs bracketing to reparse.
+            format!("[{}]:{}", self.local_host, self.local_port)
+        } else {
+            format!("{}:{}", self.local_host, self.local_port)
+        };
+        format!("{prefix}{bind}->{local}")
+    }
+}
+
+impl FromStr for ReverseSpec {
+    type Err = SpecError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let raw = input.trim();
+        if raw.is_empty() {
+            return Err(SpecError::Empty);
+        }
+
+        let (ns, target) = match raw.split_once('@') {
+            Some((ns_part, rest)) => (NsSpec::parse(ns_part)?, rest),
+            None => (NsSpec::Host, raw),
+        };
+
+        let (bind_part, local_part) = target.split_once("->").ok_or_else(|| {
+            SpecError::Malformed(
+                raw.to_string(),
+                "a reverse spec needs REMOTEBIND->LOCALTARGET".into(),
+            )
+        })?;
+
+        let (remote_bind_addr, remote_bind_port) = parse_bind_port(bind_part.trim(), raw)?;
+        let (local_host, local_port) = parse_host_port(local_part.trim(), raw)?;
+
+        Ok(ReverseSpec {
+            ns,
+            remote_bind_addr,
+            remote_bind_port,
+            local_host,
+            local_port,
+        })
+    }
+}
+
 /// Parse `[HOST:]PORT`, defaulting the host to loopback. Handles bracketed IPv6
 /// hosts like `[::1]:8080`.
 fn parse_host_port(s: &str, raw: &str) -> Result<(String, u16), SpecError> {
@@ -530,5 +635,62 @@ mod tests {
             "podman:@80".parse::<ForwardSpec>(),
             Err(SpecError::BadNamespace(..))
         ));
+    }
+
+    fn rparse(s: &str) -> ReverseSpec {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn reverse_bare_ports_default_loopback() {
+        let r = rparse("3000->3000");
+        assert_eq!(r.ns, NsSpec::Host);
+        assert_eq!(r.remote_bind_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(r.remote_bind_port, 3000);
+        assert_eq!(r.local_host, "127.0.0.1");
+        assert_eq!(r.local_port, 3000);
+    }
+
+    #[test]
+    fn reverse_explicit_bind_and_remote_target() {
+        let r = rparse("0.0.0.0:8080->192.168.1.5:80");
+        assert_eq!(r.remote_bind_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(r.remote_bind_port, 8080);
+        assert_eq!(r.local_host, "192.168.1.5");
+        assert_eq!(r.local_port, 80);
+    }
+
+    #[test]
+    fn reverse_carries_namespace() {
+        let r = rparse("podman:web@5432->5432");
+        assert_eq!(r.ns, NsSpec::Podman("web".into()));
+        assert_eq!(r.remote_bind_port, 5432);
+        assert_eq!(r.local_port, 5432);
+    }
+
+    #[test]
+    fn reverse_requires_arrow() {
+        assert!(matches!(
+            "3000".parse::<ReverseSpec>(),
+            Err(SpecError::Malformed(..))
+        ));
+    }
+
+    #[test]
+    fn reverse_spec_string_roundtrips() {
+        for raw in [
+            "3000->3000",
+            "0.0.0.0:8080->192.168.1.5:80",
+            "podman:web@5432->5432",
+            "[::]:8080->[::1]:9090",
+        ] {
+            let spec = rparse(raw);
+            let shown = spec.to_spec_string();
+            let back: ReverseSpec = shown.parse().unwrap();
+            assert_eq!(
+                spec, back,
+                "reverse form {shown:?} must reparse identically"
+            );
+        }
     }
 }

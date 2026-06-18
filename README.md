@@ -124,6 +124,28 @@ before the local port sets the listener's bind address — loopback by default
 (private), or `0.0.0.0` to expose the forward on the LAN. The TUI's `v` key
 toggles this on a live forward.
 
+### Reverse forwarding (`-R`)
+
+`-R`/`--reverse` exposes a **local** service **on the remote** — the `ssh -R`
+equivalent, the inverse of the default direction. The agent binds a listener on
+the remote host, and each connection accepted there is carried back over the
+data channel to the client, which dials a local target:
+
+```
+portmanager myhost -R 3000->3000                 # remote 127.0.0.1:3000 -> your local 3000
+portmanager myhost -R 0.0.0.0:8080->192.168.1.5:80  # expose on the remote LAN, dial a local-network host
+portmanager add  myhost -R 9000->9000            # add one to a running session
+portmanager drop myhost -R 9000                  # drop by spec or remote bind port
+```
+
+Grammar: `[NS@][BINDADDR:]REMOTEPORT->[HOST:]LOCALPORT`. `BINDADDR` defaults to
+the remote's loopback (use `0.0.0.0` to expose on the remote LAN); `HOST`
+defaults to your `127.0.0.1`. The remote bind port is strict (no fallback). The
+data path is bounded by remote DNS/reachability from the **client** side.
+Reverse forwards are remembered per host like normal forwards and shown in the
+TUI table as dimmed `← R:<port>` rows. Reverse forwarding is **QUIC-only** —
+it is not available over `--via-ssh` (use `ssh -R` directly there).
+
 ### SOCKS5 dynamic proxy
 
 `socks` binds a local SOCKS5 proxy instead of a fixed-target forward — the

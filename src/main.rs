@@ -15,7 +15,8 @@ use tracing_subscriber::EnvFilter;
 use portmanager::cli::{self, Cli, Command};
 use portmanager::client::{ForwardSet, Origin};
 use portmanager::control::{self, Request, Response};
-use portmanager::forward::ForwardSpec;
+use portmanager::forward::{ForwardSpec, ReverseSpec};
+use portmanager::reverse::ReverseSet;
 use portmanager::supervisor::{Status, Supervisor};
 use portmanager::{agent, config, crypto, discovery, doctor, logbuf, netns, tui};
 
@@ -79,24 +80,44 @@ async fn run_control_command(cmd: Command) -> Result<()> {
     }
 
     let (host, requests) = match cmd {
-        Command::Add { host, specs } => {
+        Command::Add {
+            host,
+            specs,
+            reverse,
+        } => {
             if specs.is_empty() {
                 bail!("add: pass at least one forward spec");
             }
             // Validate locally before bothering the session.
             for s in &specs {
-                s.parse::<ForwardSpec>()
-                    .map_err(|e| anyhow::anyhow!("invalid forward spec {s:?}: {e}"))?;
+                if reverse {
+                    s.parse::<ReverseSpec>()
+                        .map_err(|e| anyhow::anyhow!("invalid reverse spec {s:?}: {e}"))?;
+                } else {
+                    s.parse::<ForwardSpec>()
+                        .map_err(|e| anyhow::anyhow!("invalid forward spec {s:?}: {e}"))?;
+                }
             }
             (
                 host,
                 specs
                     .into_iter()
-                    .map(|spec| Request::Add { spec })
+                    .map(|spec| {
+                        if reverse {
+                            Request::AddReverse { spec }
+                        } else {
+                            Request::Add { spec }
+                        }
+                    })
                     .collect::<Vec<_>>(),
             )
         }
-        Command::Drop { host, specs, all } => {
+        Command::Drop {
+            host,
+            specs,
+            all,
+            reverse,
+        } => {
             if all {
                 (host, vec![Request::Clear])
             } else {
@@ -107,7 +128,13 @@ async fn run_control_command(cmd: Command) -> Result<()> {
                     host,
                     specs
                         .into_iter()
-                        .map(|spec| Request::Drop { spec })
+                        .map(|spec| {
+                            if reverse {
+                                Request::DropReverse { spec }
+                            } else {
+                                Request::Drop { spec }
+                            }
+                        })
                         .collect(),
                 )
             }
@@ -126,17 +153,22 @@ async fn run_control_command(cmd: Command) -> Result<()> {
     for req in &requests {
         match control::request(&host, req).await? {
             Response::Ok { message } => println!("{message}"),
-            Response::Forwards { entries } => print_entries(&entries),
+            Response::Forwards { entries, reverse } => {
+                print_entries(&entries);
+                print_reverse_entries(&reverse);
+            }
             Response::StatusIs {
                 state,
                 agent_version,
                 entries,
+                reverse,
             } => {
                 println!(
                     "session: {state} (agent v{agent_version}, client v{})",
                     env!("CARGO_PKG_VERSION")
                 );
                 print_entries(&entries);
+                print_reverse_entries(&reverse);
             }
             Response::Error { message } => {
                 eprintln!("error: {message}");
@@ -160,6 +192,21 @@ fn print_entries(entries: &[control::ForwardEntry]) {
             println!("{:<24} {}", e.local, e.spec);
         } else {
             println!("{:<24} {:<32} {}", e.local, e.spec, e.health);
+        }
+    }
+}
+
+/// Print reverse forwards (only when present) under a short header.
+fn print_reverse_entries(entries: &[control::ForwardEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+    println!("reverse forwards:");
+    for e in entries {
+        if e.health.is_empty() {
+            println!("  {:<24} {}", e.local, e.spec);
+        } else {
+            println!("  {:<24} {:<32} {}", e.local, e.spec, e.health);
         }
     }
 }
@@ -214,65 +261,91 @@ async fn run_client(
     log_buf: Option<logbuf::LogBuffer>,
 ) -> Result<()> {
     let tui_mode = log_buf.is_some();
-    // Resolve host, initial forwards, rules, and the persistence target from
-    // either a named profile or the per-host remembered state.
-    let (host, mut forwards, rules, persist, via_ssh) = if let Some(name) = &args.profile {
-        let config = tokio::task::spawn_blocking(config::load_config).await??;
-        let profile = config
-            .profiles
-            .get(name)
-            .with_context(|| format!("no profile {name:?} in config.toml"))?;
-        let host = args.host.clone().unwrap_or_else(|| profile.host.clone());
-        if host.is_empty() {
-            bail!("profile {name:?} has no host and none was given on the CLI");
-        }
-        let mut forwards: Vec<(ForwardSpec, Origin)> = parse_specs(&profile.forwards)
-            .with_context(|| format!("in profile {name:?}"))?
-            .into_iter()
-            .map(|s| (s, Origin::Remembered))
-            .collect();
-        forwards.extend(
-            parse_specs(&args.specs)?
-                .into_iter()
-                .map(|s| (s, Origin::UserAdded)),
-        );
-        (
-            host,
-            forwards,
-            profile.autoforward.clone(),
-            config::PersistTarget::Profile { name: name.clone() },
-            args.via_ssh || profile.via_ssh,
-        )
-    } else {
-        let host = args
-            .host
-            .clone()
-            .context("no host given; usage: portmanager <host> <spec>...")?;
-        let state = {
-            let host = host.clone();
-            tokio::task::spawn_blocking(move || config::load_state(&host)).await??
-        };
-        let mut forwards: Vec<(ForwardSpec, Origin)> = parse_specs(&args.specs)?
-            .into_iter()
-            .map(|s| (s, Origin::UserAdded))
-            .collect();
-        for remembered in state.parsed_forwards() {
-            if !forwards
-                .iter()
-                .any(|(f, _)| f.local_port == remembered.local_port)
-            {
-                forwards.push((remembered, Origin::Remembered));
+    // Resolve host, initial forwards, reverse forwards, rules, and the
+    // persistence target from either a named profile or per-host state.
+    let (host, mut forwards, mut reverse_specs, rules, persist, via_ssh) =
+        if let Some(name) = &args.profile {
+            let config = tokio::task::spawn_blocking(config::load_config).await??;
+            let profile = config
+                .profiles
+                .get(name)
+                .with_context(|| format!("no profile {name:?} in config.toml"))?;
+            let host = args.host.clone().unwrap_or_else(|| profile.host.clone());
+            if host.is_empty() {
+                bail!("profile {name:?} has no host and none was given on the CLI");
             }
-        }
-        let via_ssh = args.via_ssh || state.via_ssh;
-        (
-            host.clone(),
-            forwards,
-            state.autoforward,
-            config::PersistTarget::HostState { host },
-            via_ssh,
-        )
-    };
+            let mut forwards: Vec<(ForwardSpec, Origin)> = parse_specs(&profile.forwards)
+                .with_context(|| format!("in profile {name:?}"))?
+                .into_iter()
+                .map(|s| (s, Origin::Remembered))
+                .collect();
+            forwards.extend(
+                parse_specs(&args.specs)?
+                    .into_iter()
+                    .map(|s| (s, Origin::UserAdded)),
+            );
+            let mut reverse_specs: Vec<(ReverseSpec, Origin)> =
+                parse_reverse_specs(&profile.reverse_forwards)
+                    .with_context(|| format!("in profile {name:?}"))?
+                    .into_iter()
+                    .map(|s| (s, Origin::Remembered))
+                    .collect();
+            reverse_specs.extend(
+                parse_reverse_specs(&args.reverse)?
+                    .into_iter()
+                    .map(|s| (s, Origin::UserAdded)),
+            );
+            (
+                host,
+                forwards,
+                reverse_specs,
+                profile.autoforward.clone(),
+                config::PersistTarget::Profile { name: name.clone() },
+                args.via_ssh || profile.via_ssh,
+            )
+        } else {
+            let host = args
+                .host
+                .clone()
+                .context("no host given; usage: portmanager <host> <spec>...")?;
+            let state = {
+                let host = host.clone();
+                tokio::task::spawn_blocking(move || config::load_state(&host)).await??
+            };
+            let mut forwards: Vec<(ForwardSpec, Origin)> = parse_specs(&args.specs)?
+                .into_iter()
+                .map(|s| (s, Origin::UserAdded))
+                .collect();
+            for remembered in state.parsed_forwards() {
+                if !forwards
+                    .iter()
+                    .any(|(f, _)| f.local_port == remembered.local_port)
+                {
+                    forwards.push((remembered, Origin::Remembered));
+                }
+            }
+            let mut reverse_specs: Vec<(ReverseSpec, Origin)> = parse_reverse_specs(&args.reverse)?
+                .into_iter()
+                .map(|s| (s, Origin::UserAdded))
+                .collect();
+            for remembered in state.parsed_reverse_forwards() {
+                if !reverse_specs
+                    .iter()
+                    .any(|(r, _)| r.bind_key() == remembered.bind_key())
+                {
+                    reverse_specs.push((remembered, Origin::Remembered));
+                }
+            }
+            let via_ssh = args.via_ssh || state.via_ssh;
+            (
+                host.clone(),
+                forwards,
+                reverse_specs,
+                state.autoforward,
+                config::PersistTarget::HostState { host },
+                via_ssh,
+            )
+        };
 
     // Dedup by remote target (CLI specs win over profile/state entries). Local
     // port conflicts are resolved while binding so omitted local ports can
@@ -282,11 +355,21 @@ async fn run_client(
         forwards
             .retain(|(f, _)| seen.insert((f.ns.to_wire(), f.remote_host.clone(), f.remote_port)));
     }
+    // Dedup reverse forwards by remote bind endpoint (CLI wins over remembered).
+    {
+        let mut seen = std::collections::HashSet::new();
+        reverse_specs.retain(|(r, _)| seen.insert(r.bind_key()));
+    }
     // An empty session is valid: the TUI comes up empty and you add forwards
     // interactively, and a daemon can be populated later via `add`. Only the
     // non-interactive, non-daemon foreground path has nothing useful to do
     // empty — warn rather than fail.
-    if forwards.is_empty() && rules.is_empty() && !tui_mode && !args.daemon {
+    if forwards.is_empty()
+        && reverse_specs.is_empty()
+        && rules.is_empty()
+        && !tui_mode
+        && !args.daemon
+    {
         warn!(
             "no forwards given and none remembered for {host:?}; \
              session will sit idle (add some with `portmanager add {host} <spec>`)"
@@ -336,12 +419,26 @@ async fn run_client(
             .context("binding forward")?;
     }
 
+    // Reverse forwards (`ssh -R`): the agent binds the remote listeners; a watch
+    // task registers the set on every connection epoch and dials local targets.
+    let reverse_set = Arc::new(ReverseSet::new());
+    for (spec, origin) in reverse_specs {
+        if let Err(e) = reverse_set.add(spec, origin).await {
+            warn!(error = %e, "skipping reverse forward");
+        }
+    }
+    tokio::spawn(portmanager::reverse::watch(
+        supervisor.slot.clone(),
+        reverse_set.clone(),
+    ));
+
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
 
     // Control socket: live add/drop/list/status.
     let control_task = tokio::spawn(control::serve(control::ControlCtx {
         host: host.clone(),
         forwards: forward_set.clone(),
+        reverse: reverse_set.clone(),
         status: supervisor.status.clone(),
         agent_version: supervisor.agent_version.clone(),
         shutdown: Some(shutdown_tx),
@@ -365,6 +462,7 @@ async fn run_client(
         let result = tui::run(
             host.clone(),
             forward_set.clone(),
+            reverse_set.clone(),
             supervisor.status.clone(),
             supervisor.agent_version.clone(),
             log_buf,
@@ -587,6 +685,17 @@ fn parse_specs(specs: &[String]) -> Result<Vec<ForwardSpec>> {
         .map(|s| {
             s.parse::<ForwardSpec>()
                 .with_context(|| format!("invalid forward spec {s:?}"))
+        })
+        .collect()
+}
+
+/// Parse a list of reverse-spec strings, surfacing the offending spec on error.
+fn parse_reverse_specs(specs: &[String]) -> Result<Vec<ReverseSpec>> {
+    specs
+        .iter()
+        .map(|s| {
+            s.parse::<ReverseSpec>()
+                .with_context(|| format!("invalid reverse spec {s:?}"))
         })
         .collect()
 }

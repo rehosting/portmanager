@@ -34,6 +34,12 @@ pub struct RunArgs {
     /// Forward specs, e.g. `8888` or `192.168.4.2:8080->8080` or `podman:web@5432->5432`.
     pub specs: Vec<String>,
 
+    /// Reverse forwards (the `ssh -R` equivalent): expose a local target on the
+    /// remote. Repeatable. Grammar: `[NS@][BINDADDR:]REMOTEPORT->[HOST:]LOCALPORT`,
+    /// e.g. `-R 3000->3000` or `-R 0.0.0.0:8080->192.168.1.5:80`.
+    #[arg(short = 'R', long = "reverse")]
+    pub reverse: Vec<String>,
+
     /// Load a named profile from the config file instead of (or in addition to) specs.
     #[arg(short, long)]
     pub profile: Option<String>,
@@ -93,18 +99,25 @@ pub enum Command {
     Add {
         /// Target host whose session to modify.
         host: String,
-        /// Forward specs to add.
+        /// Forward specs to add (reverse specs when `--reverse` is set).
         specs: Vec<String>,
+        /// Treat SPECS as reverse forwards (`ssh -R` equivalent).
+        #[arg(short = 'R', long)]
+        reverse: bool,
     },
     /// Remove forwards from the running session for HOST.
     Drop {
         /// Target host whose session to modify.
         host: String,
-        /// Forward specs (or local ports) to remove.
+        /// Forward specs (or local ports) to remove. With `--reverse`, reverse
+        /// specs (or remote bind ports).
         specs: Vec<String>,
         /// Remove every forward (ignores SPECS); same as `clear`.
         #[arg(long)]
         all: bool,
+        /// Treat SPECS as reverse forwards (`ssh -R` equivalent).
+        #[arg(short = 'R', long)]
+        reverse: bool,
     },
     /// Remove every forward from the running session for HOST.
     Clear {

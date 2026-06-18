@@ -463,7 +463,9 @@ async fn handle_tunnel_conn(
         OP_STREAM => {
             state_tx.send_modify(|(n, _)| *n += 1);
             let (read, write) = tcp.into_split();
-            if let Err(e) = handle_stream(write, read, pool).await {
+            // No QUIC connection to open streams back on: reverse forwarding is
+            // unsupported over the SSH tunnel (handle_stream rejects @reverse).
+            if let Err(e) = handle_stream(write, read, pool, None).await {
                 let error = error::format_chain(&e);
                 warn!(%error, "tunnel stream failed");
             }
@@ -493,8 +495,11 @@ async fn handle_connection(conn: Connection, pool: Arc<HelperPool>) -> bool {
             }
         };
         let pool = pool.clone();
+        // Clone the connection so a reverse-registration stream can open data
+        // streams back to the client.
+        let back = conn.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_stream(send, recv, pool).await {
+            if let Err(e) = handle_stream(send, recv, pool, Some(back)).await {
                 let error = error::format_chain(&e);
                 warn!(%error, "stream failed");
             }
@@ -505,7 +510,12 @@ async fn handle_connection(conn: Connection, pool: Arc<HelperPool>) -> bool {
 /// Read the header, dial the target (in-namespace when requested), and splice.
 /// Generic over the transport's stream halves (QUIC streams or a tunnel TCP
 /// connection's halves).
-async fn handle_stream<W, R>(send: W, mut recv: R, pool: Arc<HelperPool>) -> Result<()>
+async fn handle_stream<W, R>(
+    send: W,
+    mut recv: R,
+    pool: Arc<HelperPool>,
+    back: Option<Connection>,
+) -> Result<()>
 where
     W: AsyncWrite + Send + Unpin,
     R: AsyncRead + Send + Unpin,
@@ -517,6 +527,12 @@ where
     // Dedicated discovery stream (port scanner push channel).
     if header.host == crate::discovery::DISCOVERY_HOST {
         return crate::discovery::serve(send, recv).await;
+    }
+
+    // Dedicated reverse-forwarding registration stream (the agent binds remote
+    // listeners and opens data streams back on `back`).
+    if header.host == crate::reverse::REVERSE_HOST {
+        return crate::reverse::serve_registration(send, recv, back).await;
     }
 
     let target = format!("{}:{}", header.host, header.port);

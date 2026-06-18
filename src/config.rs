@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::forward::ForwardSpec;
+use crate::forward::{ForwardSpec, ReverseSpec};
 
 /// One auto-forward rule: which discovered listeners to forward automatically.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,6 +60,9 @@ pub struct HostState {
     /// Forward specs (CLI grammar) the last session ended with.
     #[serde(default)]
     pub forwards: Vec<String>,
+    /// Reverse-forward specs (`ssh -R`) the last session ended with.
+    #[serde(default)]
+    pub reverse_forwards: Vec<String>,
     /// Stable local-port assignments for auto-forwards: `"<ns>/<remote_port>"`
     /// -> local port. Keeps a discovered port on the same local port across
     /// sessions.
@@ -84,6 +87,15 @@ impl HostState {
             .collect()
     }
 
+    /// Parse the remembered reverse-forward specs, skipping any that no longer
+    /// parse.
+    pub fn parsed_reverse_forwards(&self) -> Vec<ReverseSpec> {
+        self.reverse_forwards
+            .iter()
+            .filter_map(|s| s.parse::<ReverseSpec>().ok())
+            .collect()
+    }
+
     /// The assignment key for a discovered listener.
     pub fn assignment_key(ns_wire: &str, remote_port: u16) -> String {
         format!("{ns_wire}/{remote_port}")
@@ -98,6 +110,9 @@ pub struct Profile {
     /// Forward specs in CLI grammar.
     #[serde(default)]
     pub forwards: Vec<String>,
+    /// Reverse-forward specs (`ssh -R`) for this profile.
+    #[serde(default)]
+    pub reverse_forwards: Vec<String>,
     /// Auto-forward rules for this profile.
     #[serde(default)]
     pub autoforward: Vec<AutoForwardRule>,
@@ -153,12 +168,13 @@ pub enum PersistTarget {
 }
 
 impl PersistTarget {
-    /// Replace the persisted forward list with `specs`.
-    pub fn save_forwards(&self, specs: Vec<String>) -> Result<()> {
+    /// Replace the persisted forward and reverse-forward lists.
+    pub fn save_forwards(&self, specs: Vec<String>, reverse: Vec<String>) -> Result<()> {
         match self {
             PersistTarget::HostState { host } => {
                 let mut state = load_state(host)?;
                 state.forwards = specs;
+                state.reverse_forwards = reverse;
                 save_state(host, &state)
             }
             PersistTarget::Profile { name } => {
@@ -168,6 +184,7 @@ impl PersistTarget {
                     .get_mut(name)
                     .with_context(|| format!("profile {name:?} vanished from config.toml"))?;
                 profile.forwards = specs;
+                profile.reverse_forwards = reverse;
                 save_config(&config)
             }
         }

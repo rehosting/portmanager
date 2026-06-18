@@ -20,6 +20,7 @@ pub mod logbuf;
 pub mod netns;
 pub mod netwatch;
 pub mod proto;
+pub mod reverse;
 pub mod socks;
 pub mod supervisor;
 pub mod transport;

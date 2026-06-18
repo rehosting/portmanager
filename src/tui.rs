@@ -37,15 +37,18 @@ use crate::control;
 use crate::discovery::{Listener, spec_for_listener};
 use crate::forward::ForwardSpec;
 use crate::logbuf::LogBuffer;
+use crate::reverse::{ReverseSet, ReverseSnapshot};
 use crate::supervisor::Status;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// Run the TUI until the user quits or the session is stopped. Restores the
 /// terminal on every exit path (normal, error, or panic).
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     host: String,
     forward_set: Arc<ForwardSet>,
+    reverse_set: Arc<ReverseSet>,
     mut status: watch::Receiver<Status>,
     agent_version: watch::Receiver<String>,
     log_buf: LogBuffer,
@@ -73,6 +76,7 @@ pub async fn run(
     loop {
         // Refresh the view-model, then draw.
         app.forwards = forward_set.list().await;
+        app.reverse = reverse_set.list().await;
         app.connected = matches!(*status.borrow(), Status::Connected);
         app.status = status.borrow().clone();
         app.agent_version = agent_version.borrow().clone();
@@ -144,6 +148,7 @@ const THROUGHPUT_HISTORY: usize = 60;
 struct App {
     host: String,
     forwards: Vec<ForwardSnapshot>,
+    reverse: Vec<ReverseSnapshot>,
     listeners: Vec<Listener>,
     logs: Vec<String>,
     status: Status,
@@ -173,6 +178,7 @@ impl App {
         App {
             host,
             forwards: Vec::new(),
+            reverse: Vec::new(),
             listeners: Vec::new(),
             logs: Vec::new(),
             status: Status::Bootstrapping,
@@ -666,7 +672,7 @@ impl App {
 
         // Build owned rows from the filtered view, then drop the borrow so the
         // stateful render can take `&mut self.table`.
-        let rows: Vec<Row> = {
+        let mut rows: Vec<Row> = {
             let visible = self.visible();
             visible
                 .iter()
@@ -697,7 +703,7 @@ impl App {
                         format!("{}:{}", s.spec.remote_host, s.spec.remote_port)
                     };
                     Row::new(vec![
-                        Cell::from(s.local.port().to_string()),
+                        Cell::from(format!("→ {}", s.local.port())),
                         Cell::from(forwarded),
                         Cell::from(process),
                         Cell::from(ns_disp),
@@ -709,6 +715,43 @@ impl App {
                 })
                 .collect()
         };
+        let forward_count = rows.len();
+
+        // Reverse forwards (ssh -R) are appended as non-selectable rows: the data
+        // direction is inverted (the agent binds the remote port, the client
+        // dials the local target), so the Port column shows the remote bind and
+        // the address column the local target. Hidden while a filter is active
+        // (the filter only matches forwards). Their cells are dimmed to read as a
+        // distinct, read-only section.
+        if self.filter.is_empty() {
+            let dim = Style::default().add_modifier(Modifier::DIM);
+            for s in &self.reverse {
+                let ns = s.spec.ns.to_wire();
+                let ns_disp = if ns.is_empty() {
+                    "host".to_string()
+                } else {
+                    ns.clone()
+                };
+                let visibility = if s.spec.remote_bind_addr == IpAddr::V4(Ipv4Addr::LOCALHOST) {
+                    "private".to_string()
+                } else {
+                    format!("exposed ({})", s.spec.remote_bind_addr)
+                };
+                rows.push(
+                    Row::new(vec![
+                        Cell::from(format!("← R:{}", s.spec.remote_bind_port)),
+                        Cell::from(format!("{}:{}", s.spec.local_host, s.spec.local_port)),
+                        Cell::from("—"),
+                        Cell::from(ns_disp),
+                        Cell::from(visibility),
+                        Cell::from(s.origin.label()),
+                        Cell::from("—"),
+                        Cell::from(control::reverse_health_label(connected, s)),
+                    ])
+                    .style(dim),
+                );
+            }
+        }
         let count = rows.len();
 
         let header = Row::new(vec![
@@ -735,10 +778,16 @@ impl App {
             Constraint::Min(18),
         ];
 
-        let title = if self.filter.is_empty() {
-            format!(" forwards ({count}) ")
+        let rev = self.reverse.len();
+        let rev_suffix = if rev > 0 && self.filter.is_empty() {
+            format!(" · reverse ({rev})")
         } else {
-            format!(" forwards ({count}, filter {:?}) ", self.filter)
+            String::new()
+        };
+        let title = if self.filter.is_empty() {
+            format!(" forwards ({forward_count}){rev_suffix} ")
+        } else {
+            format!(" forwards ({forward_count}, filter {:?}) ", self.filter)
         };
         let table = Table::new(rows, widths)
             .header(header)
