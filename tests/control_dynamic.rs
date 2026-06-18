@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use portmanager::client::{ForwardSet, conn_slot};
+use portmanager::reverse::ReverseSet;
 // Only used by the Linux-gated discovery test below.
 #[cfg(target_os = "linux")]
 use portmanager::config::AutoForwardRule;
@@ -67,9 +68,11 @@ async fn control_socket_add_drop_list_status() {
     let (_status_tx, status_rx) = watch::channel(Status::Connected);
 
     let (_av_tx, av_rx) = watch::channel("test-agent".to_string());
+    let reverse = Arc::new(ReverseSet::new());
     let ctx = ControlCtx {
         host: host.clone(),
         forwards: forwards.clone(),
+        reverse: reverse.clone(),
         status: status_rx,
         agent_version: av_rx,
         shutdown: None,
@@ -101,9 +104,10 @@ async fn control_socket_add_drop_list_status() {
     // list shows it
     let resp = control::request(&host, &Request::List).await.unwrap();
     match resp {
-        Response::Forwards { entries } => {
+        Response::Forwards { entries, reverse } => {
             assert_eq!(entries.len(), 1);
             assert!(entries[0].local.ends_with(&format!(":{port}")));
+            assert!(reverse.is_empty());
         }
         other => panic!("unexpected list response: {other:?}"),
     }
@@ -115,10 +119,12 @@ async fn control_socket_add_drop_list_status() {
             state,
             agent_version,
             entries,
+            reverse,
         } => {
             assert_eq!(state, "connected");
             assert_eq!(agent_version, "test-agent");
             assert_eq!(entries.len(), 1);
+            assert!(reverse.is_empty());
         }
         other => panic!("unexpected status response: {other:?}"),
     }

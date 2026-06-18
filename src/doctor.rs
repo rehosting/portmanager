@@ -79,10 +79,12 @@ pub async fn run(host: &str) -> Result<()> {
             state,
             agent_version,
             entries,
+            reverse,
         }) => {
             pass(&format!(
-                "running session: {state}; agent v{agent_version}; {} forward(s)",
-                entries.len()
+                "running session: {state}; agent v{agent_version}; {} forward(s), {} reverse",
+                entries.len(),
+                reverse.len()
             ));
             if agent_version != env!("CARGO_PKG_VERSION") {
                 note(&format!(

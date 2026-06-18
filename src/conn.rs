@@ -28,7 +28,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
@@ -67,6 +67,19 @@ impl Conn {
                 Ok((Box::new(send), Box::new(recv)))
             }
             Conn::Ssh(s) => s.open_stream().await,
+        }
+    }
+
+    /// Accept a bidirectional stream the *agent* opened (the reverse-forwarding
+    /// data path). The SSH tunnel carries only client-initiated streams, so
+    /// reverse forwarding is unsupported there.
+    pub async fn accept_bi(&self) -> Result<(SendHalf, RecvHalf)> {
+        match self {
+            Conn::Quic(c) => {
+                let (send, recv) = c.accept_bi().await.context("accepting QUIC stream")?;
+                Ok((Box::new(send), Box::new(recv)))
+            }
+            Conn::Ssh(_) => bail!("reverse forwarding is not supported over --via-ssh"),
         }
     }
 }

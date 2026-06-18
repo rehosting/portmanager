@@ -20,7 +20,8 @@ use tracing::{info, warn};
 
 use crate::client::ForwardSet;
 use crate::config::PersistTarget;
-use crate::forward::ForwardSpec;
+use crate::forward::{ForwardSpec, ReverseSpec};
+use crate::reverse::{ReverseSet, ReverseSnapshot};
 use crate::supervisor::Status;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31,7 +32,15 @@ pub enum Request {
     Drop {
         spec: String,
     },
-    /// Remove every forward at once.
+    /// Add a reverse forward (`ssh -R` equivalent).
+    AddReverse {
+        spec: String,
+    },
+    /// Remove a reverse forward by spec or remote bind port.
+    DropReverse {
+        spec: String,
+    },
+    /// Remove every forward at once (both directions).
     Clear,
     List,
     Status,
@@ -45,11 +54,17 @@ pub enum Response {
     },
     Forwards {
         entries: Vec<ForwardEntry>,
+        /// Reverse forwards (`ssh -R`). Defaulted for back-compat with older
+        /// clients that don't send/expect the field.
+        #[serde(default)]
+        reverse: Vec<ForwardEntry>,
     },
     StatusIs {
         state: String,
         agent_version: String,
         entries: Vec<ForwardEntry>,
+        #[serde(default)]
+        reverse: Vec<ForwardEntry>,
     },
     Error {
         message: String,
@@ -114,6 +129,8 @@ pub fn socket_path(host: &str) -> Result<PathBuf> {
 pub struct ControlCtx {
     pub host: String,
     pub forwards: Arc<ForwardSet>,
+    /// Reverse forwards (`ssh -R`) for this session.
+    pub reverse: Arc<ReverseSet>,
     pub status: watch::Receiver<Status>,
     /// Current agent binary version (for skew display in `status`).
     pub agent_version: watch::Receiver<String>,
@@ -225,12 +242,36 @@ async fn dispatch(req: Request, ctx: &ControlCtx) -> (Response, bool) {
                 false,
             ),
         },
+        Request::AddReverse { spec } => match add_reverse(&spec, ctx).await {
+            Ok(()) => (
+                Response::Ok {
+                    message: format!("reverse forward added: {spec}"),
+                },
+                false,
+            ),
+            Err(e) => (
+                Response::Error {
+                    message: format!("{e:#}"),
+                },
+                false,
+            ),
+        },
+        Request::DropReverse { spec } => match drop_reverse(&spec, ctx).await {
+            Ok(msg) => (Response::Ok { message: msg }, false),
+            Err(e) => (
+                Response::Error {
+                    message: format!("{e:#}"),
+                },
+                false,
+            ),
+        },
         Request::Clear => {
             let n = ctx.forwards.clear().await;
+            let r = ctx.reverse.clear().await;
             persist(ctx).await;
             (
                 Response::Ok {
-                    message: format!("dropped {n} forward(s)"),
+                    message: format!("dropped {n} forward(s) and {r} reverse forward(s)"),
                 },
                 false,
             )
@@ -238,6 +279,7 @@ async fn dispatch(req: Request, ctx: &ControlCtx) -> (Response, bool) {
         Request::List => (
             Response::Forwards {
                 entries: entries(ctx).await,
+                reverse: reverse_entries(ctx).await,
             },
             false,
         ),
@@ -253,6 +295,7 @@ async fn dispatch(req: Request, ctx: &ControlCtx) -> (Response, bool) {
                     state,
                     agent_version,
                     entries: entries(ctx).await,
+                    reverse: reverse_entries(ctx).await,
                 },
                 false,
             )
@@ -297,12 +340,40 @@ pub fn health_label(connected: bool, s: &crate::client::ForwardSnapshot) -> Stri
     if !connected {
         return "session reconnecting".to_string();
     }
-    match (s.ok_connections, &s.last_error) {
+    health_label_parts(s.ok_connections, &s.last_error)
+}
+
+/// Render a reverse forward's live health (same shape as [`health_label`]).
+pub fn reverse_health_label(connected: bool, s: &ReverseSnapshot) -> String {
+    if !connected {
+        return "session reconnecting".to_string();
+    }
+    health_label_parts(s.ok_connections, &s.last_error)
+}
+
+fn health_label_parts(ok_connections: u64, last_error: &Option<String>) -> String {
+    match (ok_connections, last_error) {
         (0, None) => "idle".to_string(),
         (0, Some(err)) => format!("last error: {err}"),
         (n, None) => format!("ok ({n} conns)"),
         (n, Some(err)) => format!("ok ({n} conns); last error: {err}"),
     }
+}
+
+/// Reverse forwards rendered as `ForwardEntry`s for `list`/`status`. The `spec`
+/// is the canonical reverse spec; `local` shows the client-local dial target.
+async fn reverse_entries(ctx: &ControlCtx) -> Vec<ForwardEntry> {
+    let connected = matches!(&*ctx.status.borrow(), Status::Connected);
+    ctx.reverse
+        .list()
+        .await
+        .into_iter()
+        .map(|s| ForwardEntry {
+            local: format!("-> {}:{}", s.spec.local_host, s.spec.local_port),
+            spec: s.spec.to_spec_string(),
+            health: reverse_health_label(connected, &s),
+        })
+        .collect()
 }
 
 async fn add_forward(spec: &str, ctx: &ControlCtx) -> Result<std::net::SocketAddr> {
@@ -313,6 +384,22 @@ async fn add_forward(spec: &str, ctx: &ControlCtx) -> Result<std::net::SocketAdd
         .await?;
     persist(ctx).await;
     Ok(local)
+}
+
+async fn add_reverse(spec: &str, ctx: &ControlCtx) -> Result<()> {
+    let parsed: ReverseSpec = spec.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
+    ctx.reverse
+        .add(parsed, crate::client::Origin::UserAdded)
+        .await?;
+    persist(ctx).await;
+    Ok(())
+}
+
+/// `drop --reverse` accepts a full reverse spec or just a remote bind port.
+async fn drop_reverse(spec: &str, ctx: &ControlCtx) -> Result<String> {
+    let dropped = ctx.reverse.remove(spec).await?;
+    persist(ctx).await;
+    Ok(format!("dropped reverse {}", dropped.to_spec_string()))
 }
 
 /// `drop` accepts either a full spec or just a local port.
@@ -328,8 +415,8 @@ async fn drop_forward(spec: &str, ctx: &ControlCtx) -> Result<String> {
     Ok(format!("dropped {}", display_spec(&dropped)))
 }
 
-/// Write the live forward set back to the persistence target (host state file
-/// or named profile), preserving assignments and rules.
+/// Write the live forward and reverse-forward sets back to the persistence
+/// target (host state file or named profile), preserving assignments and rules.
 async fn persist(ctx: &ControlCtx) {
     let specs: Vec<String> = ctx
         .forwards
@@ -338,8 +425,15 @@ async fn persist(ctx: &ControlCtx) {
         .into_iter()
         .map(|s| display_spec(&s.spec))
         .collect();
+    let reverse: Vec<String> = ctx
+        .reverse
+        .list()
+        .await
+        .into_iter()
+        .map(|s| s.spec.to_spec_string())
+        .collect();
     let target = ctx.persist.clone();
-    let res = tokio::task::spawn_blocking(move || target.save_forwards(specs)).await;
+    let res = tokio::task::spawn_blocking(move || target.save_forwards(specs, reverse)).await;
     match res {
         Ok(Ok(())) => {}
         Ok(Err(e)) => warn!(error = %e, "persistence failed"),
@@ -521,11 +615,33 @@ mod tests {
                 local: "127.0.0.1:8888".into(),
                 health: "ok (1 conns)".into(),
             }],
+            reverse: vec![ForwardEntry {
+                spec: "3000->3000".into(),
+                local: "-> 127.0.0.1:3000".into(),
+                health: "idle".into(),
+            }],
         };
         let s = serde_json::to_string(&resp).unwrap();
         assert!(matches!(
             serde_json::from_str::<Response>(&s).unwrap(),
             Response::StatusIs { .. }
+        ));
+
+        // Reverse request variants round-trip.
+        let s = serde_json::to_string(&Request::AddReverse {
+            spec: "0.0.0.0:8080->192.168.1.5:80".into(),
+        })
+        .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Request>(&s).unwrap(),
+            Request::AddReverse { .. }
+        ));
+
+        // An old client's response (no `reverse` field) still deserializes.
+        let legacy = r#"{"Forwards":{"entries":[]}}"#;
+        assert!(matches!(
+            serde_json::from_str::<Response>(legacy).unwrap(),
+            Response::Forwards { .. }
         ));
     }
 
