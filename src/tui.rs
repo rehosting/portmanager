@@ -35,7 +35,7 @@ use tokio::sync::{mpsc, watch};
 use crate::client::{ForwardSet, ForwardSnapshot, Origin};
 use crate::control;
 use crate::discovery::{Listener, spec_for_listener};
-use crate::forward::ForwardSpec;
+use crate::forward::{ForwardSpec, ReverseSpec};
 use crate::logbuf::LogBuffer;
 use crate::reverse::{ReverseSet, ReverseSnapshot};
 use crate::supervisor::Status;
@@ -70,7 +70,7 @@ pub async fn run(
         }
     });
 
-    let mut app = App::new(host);
+    let mut app = App::new(host, reverse_set.clone());
     let mut tick = tokio::time::interval(Duration::from_millis(250));
 
     loop {
@@ -149,6 +149,8 @@ struct App {
     host: String,
     forwards: Vec<ForwardSnapshot>,
     reverse: Vec<ReverseSnapshot>,
+    /// Live reverse-forward set, so the `a` prompt can add reverse forwards.
+    reverse_set: Arc<ReverseSet>,
     listeners: Vec<Listener>,
     logs: Vec<String>,
     status: Status,
@@ -170,7 +172,7 @@ struct App {
 }
 
 impl App {
-    fn new(host: String) -> Self {
+    fn new(host: String, reverse_set: Arc<ReverseSet>) -> Self {
         let mut table = TableState::default();
         table.select(Some(0));
         let mut picker = TableState::default();
@@ -179,6 +181,7 @@ impl App {
             host,
             forwards: Vec::new(),
             reverse: Vec::new(),
+            reverse_set,
             listeners: Vec::new(),
             logs: Vec::new(),
             status: Status::Bootstrapping,
@@ -484,6 +487,13 @@ impl App {
     }
 
     async fn add_forward(&mut self, spec: &str, forwards: &Arc<ForwardSet>) {
+        // A leading `-R` (mirroring the CLI's `--reverse`) requests a reverse
+        // forward; otherwise the spec is a normal forward. Both grammars use
+        // `->`, so the flag is what disambiguates them.
+        if let Some(rest) = reverse_flag_rest(spec) {
+            self.add_reverse(rest).await;
+            return;
+        }
         let parsed: ForwardSpec = match spec.parse() {
             Ok(p) => p,
             Err(e) => {
@@ -494,6 +504,21 @@ impl App {
         match forwards.add(parsed, Origin::UserAdded).await {
             Ok(local) => self.message = Some(format!("forwarding on {local}")),
             Err(e) => self.message = Some(format!("add failed: {e:#}")),
+        }
+    }
+
+    async fn add_reverse(&mut self, spec: &str) {
+        let parsed: ReverseSpec = match spec.parse() {
+            Ok(p) => p,
+            Err(e) => {
+                self.message = Some(format!("invalid reverse spec {spec:?}: {e}"));
+                return;
+            }
+        };
+        let bind = format!("{}:{}", parsed.remote_bind_addr, parsed.remote_bind_port);
+        match self.reverse_set.add(parsed, Origin::UserAdded).await {
+            Ok(()) => self.message = Some(format!("reverse forward bound on remote {bind}")),
+            Err(e) => self.message = Some(format!("reverse add failed: {e:#}")),
         }
     }
 
@@ -853,7 +878,7 @@ impl App {
         let cursor = Span::styled("▏", Style::default().add_modifier(Modifier::SLOW_BLINK));
         let line = match self.mode {
             Mode::AddInput => Line::from(vec![
-                Span::styled("add forward: ", cyan),
+                Span::styled("add forward (-R for reverse): ", cyan),
                 Span::raw(&self.input),
                 cursor,
             ]),
@@ -893,7 +918,7 @@ impl App {
             .borders(Borders::ALL)
             .title(" keybindings ");
         let rows = [
-            ("a", "add a forward (type a spec, Enter)"),
+            ("a", "add a forward (spec, Enter; prefix -R for reverse)"),
             ("d / Del", "drop the selected forward (confirm)"),
             ("o / Enter", "open the forward in a browser"),
             ("y", "copy the forward's URL to the clipboard"),
@@ -1101,6 +1126,23 @@ fn forward_url(local_port: u16) -> String {
     format!("http://127.0.0.1:{local_port}")
 }
 
+/// If `input` begins with a `-R`/`--reverse` flag (the CLI's reverse marker),
+/// return the trimmed remainder — the reverse spec. Returns `None` when no such
+/// flag is present, so the input is a normal forward spec.
+fn reverse_flag_rest(input: &str) -> Option<&str> {
+    let trimmed = input.trim_start();
+    for flag in ["--reverse", "-R", "-r"] {
+        if let Some(rest) = trimmed.strip_prefix(flag) {
+            // Require the flag to be a whole token (followed by whitespace or
+            // end), so `-Rfoo` or a spec like `r->...` isn't misread.
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                return Some(rest.trim());
+            }
+        }
+    }
+    None
+}
+
 /// Hand `url` to the platform's default-application opener, detached. Returns an
 /// error if the opener can't be spawned (e.g. headless host with no `xdg-open`).
 fn open_in_browser(url: &str) -> Result<()> {
@@ -1256,8 +1298,19 @@ mod tests {
     }
 
     #[test]
+    fn reverse_flag_detected_only_as_whole_token() {
+        assert_eq!(reverse_flag_rest("-R 3000->3000"), Some("3000->3000"));
+        assert_eq!(reverse_flag_rest("--reverse 8080->80"), Some("8080->80"));
+        assert_eq!(reverse_flag_rest("  -R  3000->3000  "), Some("3000->3000"));
+        // No flag: a normal forward spec passes through untouched.
+        assert_eq!(reverse_flag_rest("3000->3000"), None);
+        // The flag must be its own token, not glued to the spec.
+        assert_eq!(reverse_flag_rest("-R3000->3000"), None);
+    }
+
+    #[test]
     fn renders_columns_and_joins_process() {
-        let mut app = App::new("myhost".into());
+        let mut app = App::new("myhost".into(), Arc::new(ReverseSet::new()));
         app.status = Status::Connected;
         app.connected = true;
         app.agent_version = "0.1.0".into();
@@ -1284,7 +1337,7 @@ mod tests {
 
     #[test]
     fn exposed_forward_reads_exposed() {
-        let mut app = App::new("h".into());
+        let mut app = App::new("h".into(), Arc::new(ReverseSet::new()));
         app.forwards = vec![snapshot(
             "8080->0.0.0.0:8080",
             "0.0.0.0:8080",
@@ -1300,7 +1353,7 @@ mod tests {
 
     #[test]
     fn empty_session_shows_hint() {
-        let mut app = App::new("h".into());
+        let mut app = App::new("h".into(), Arc::new(ReverseSet::new()));
         let text = render(&mut app, 100, 20);
         assert!(
             text.contains("Press 'a' to add"),
@@ -1315,7 +1368,7 @@ mod tests {
 
     #[test]
     fn socks_forward_renders_as_dynamic() {
-        let mut app = App::new("h".into());
+        let mut app = App::new("h".into(), Arc::new(ReverseSet::new()));
         app.forwards = vec![snapshot("socks->1080", "127.0.0.1:1080", Origin::UserAdded)];
         let text = render(&mut app, 140, 20);
         assert!(
@@ -1326,7 +1379,7 @@ mod tests {
 
     #[test]
     fn help_overlay_lists_keys() {
-        let mut app = App::new("h".into());
+        let mut app = App::new("h".into(), Arc::new(ReverseSet::new()));
         app.mode = Mode::Help;
         let text = render(&mut app, 100, 30);
         assert!(text.contains("keybindings"), "help title missing: {text}");
@@ -1336,7 +1389,7 @@ mod tests {
 
     #[test]
     fn confirm_drop_prompts_before_dropping() {
-        let mut app = App::new("h".into());
+        let mut app = App::new("h".into(), Arc::new(ReverseSet::new()));
         app.forwards = vec![snapshot("8888", "127.0.0.1:8888", Origin::UserAdded)];
         app.mode = Mode::ConfirmDrop;
         let text = render(&mut app, 100, 20);
@@ -1348,7 +1401,7 @@ mod tests {
 
     #[test]
     fn filter_hides_non_matching_rows() {
-        let mut app = App::new("h".into());
+        let mut app = App::new("h".into(), Arc::new(ReverseSet::new()));
         app.forwards = vec![
             snapshot("8888", "127.0.0.1:8888", Origin::UserAdded),
             snapshot("5432", "127.0.0.1:5432", Origin::UserAdded),
@@ -1365,7 +1418,7 @@ mod tests {
 
     #[test]
     fn detail_pane_shows_full_error_and_bytes() {
-        let mut app = App::new("h".into());
+        let mut app = App::new("h".into(), Arc::new(ReverseSet::new()));
         let mut snap = snapshot("8888", "127.0.0.1:8888", Origin::UserAdded);
         snap.bytes_up = 2048;
         snap.last_error = Some("connection refused dialing target".into());
@@ -1385,7 +1438,7 @@ mod tests {
 
     #[test]
     fn picker_lists_unforwarded_and_hides_forwarded() {
-        let mut app = App::new("h".into());
+        let mut app = App::new("h".into(), Arc::new(ReverseSet::new()));
         // 8888 is already forwarded; 9000 is not.
         app.forwards = vec![snapshot("8888", "127.0.0.1:8888", Origin::UserAdded)];
         app.listeners = vec![
@@ -1418,7 +1471,7 @@ mod tests {
 
     #[test]
     fn throughput_rate_is_derived_between_samples() {
-        let mut app = App::new("h".into());
+        let mut app = App::new("h".into(), Arc::new(ReverseSet::new()));
         let mut snap = snapshot("8888", "127.0.0.1:8888", Origin::UserAdded);
         app.forwards = vec![snap.clone()];
         let t0 = Instant::now();
