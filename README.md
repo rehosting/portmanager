@@ -143,8 +143,10 @@ the remote's loopback (use `0.0.0.0` to expose on the remote LAN); `HOST`
 defaults to your `127.0.0.1`. The remote bind port is strict (no fallback). The
 data path is bounded by remote DNS/reachability from the **client** side.
 Reverse forwards are remembered per host like normal forwards and shown in the
-TUI table as dimmed `← R:<port>` rows. Reverse forwarding is **QUIC-only** —
-it is not available over `--via-ssh` (use `ssh -R` directly there).
+TUI table as dimmed `← <port>` rows (vs `→ <port>` for forwards); select one and
+press `d` to drop or `i` to inspect it, or add one live with `a` then
+`-R <spec>`. Reverse forwarding is **QUIC-only** — it is not available over
+`--via-ssh` (use `ssh -R` directly there).
 
 ### SOCKS5 dynamic proxy
 
