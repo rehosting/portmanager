@@ -110,6 +110,12 @@ enum Action {
     Quit,
 }
 
+/// The currently-selected table row: a forward or a reverse forward.
+enum Selection {
+    Forward(ForwardSnapshot),
+    Reverse(ReverseSnapshot),
+}
+
 /// What the key loop and renderer are currently doing.
 enum Mode {
     /// Browsing the forwards table.
@@ -276,14 +282,30 @@ impl App {
         }
     }
 
+    /// Reverse forwards shown in the table. They appear (and are selectable)
+    /// only when no filter is active — the filter matches forwards.
+    fn reverse_visible(&self) -> Vec<&ReverseSnapshot> {
+        if self.filter.is_empty() {
+            self.reverse.iter().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Number of selectable rows: filtered forwards, then reverse forwards. The
+    /// table selection indexes into this combined list (forwards first).
+    fn selectable_len(&self) -> usize {
+        self.visible().len() + self.reverse_visible().len()
+    }
+
     /// Keep both selections within bounds as forwards and discovered ports come
     /// and go.
     fn clamp_selection(&mut self) {
-        let visible = self.visible().len();
-        if visible == 0 {
+        let rows = self.selectable_len();
+        if rows == 0 {
             self.table.select(None);
         } else {
-            let sel = self.table.selected().unwrap_or(0).min(visible - 1);
+            let sel = self.table.selected().unwrap_or(0).min(rows - 1);
             self.table.select(Some(sel));
         }
         let discovered = self.discovered_unforwarded().len();
@@ -295,18 +317,37 @@ impl App {
         }
     }
 
-    /// The selected forward, indexed into the filtered view. Cloned so the borrow
-    /// of `self` doesn't outlive the lookup (callers then mutate `self`).
+    /// The selected row (a forward or a reverse forward), indexed into the
+    /// combined view. Cloned so the borrow of `self` doesn't outlive the lookup.
+    fn selected_row(&self) -> Option<Selection> {
+        let i = self.table.selected()?;
+        let forwards = self.visible();
+        if i < forwards.len() {
+            return Some(Selection::Forward((*forwards[i]).clone()));
+        }
+        let reverse = self.reverse_visible();
+        reverse
+            .get(i - forwards.len())
+            .map(|r| Selection::Reverse((*r).clone()))
+    }
+
+    /// The selected *forward* (None when a reverse row is selected). Used by the
+    /// forward-only actions (open/copy/visibility).
     fn selected(&self) -> Option<ForwardSnapshot> {
-        let visible = self.visible();
-        self.table
-            .selected()
-            .and_then(|i| visible.get(i))
-            .map(|s| (*s).clone())
+        match self.selected_row() {
+            Some(Selection::Forward(f)) => Some(f),
+            _ => None,
+        }
+    }
+
+    /// Whether the selected row is a reverse forward (forward-only actions hint
+    /// instead of acting).
+    fn reverse_selected(&self) -> bool {
+        matches!(self.selected_row(), Some(Selection::Reverse(_)))
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let len = self.visible().len() as isize;
+        let len = self.selectable_len() as isize;
         if len == 0 {
             return;
         }
@@ -367,16 +408,35 @@ impl App {
                 self.message = None;
             }
             KeyCode::Char('d') | KeyCode::Delete => {
-                if self.selected().is_some() {
+                if self.selected_row().is_some() {
                     self.mode = Mode::ConfirmDrop;
                     self.message = None;
                 }
             }
-            KeyCode::Char('v') => self.toggle_visibility(forwards).await,
-            KeyCode::Char('o') | KeyCode::Enter => self.open_selected(),
-            KeyCode::Char('y') => self.copy_selected(),
+            KeyCode::Char('v') => {
+                if self.reverse_selected() {
+                    self.message =
+                        Some("reverse visibility is set by its bind address at add time".into());
+                } else {
+                    self.toggle_visibility(forwards).await;
+                }
+            }
+            KeyCode::Char('o') | KeyCode::Enter => {
+                if self.reverse_selected() {
+                    self.message = Some("open/copy apply to forwards only".into());
+                } else {
+                    self.open_selected();
+                }
+            }
+            KeyCode::Char('y') => {
+                if self.reverse_selected() {
+                    self.message = Some("open/copy apply to forwards only".into());
+                } else {
+                    self.copy_selected();
+                }
+            }
             KeyCode::Char('i') => {
-                if self.selected().is_some() {
+                if self.selected_row().is_some() {
                     self.mode = Mode::Detail;
                 }
             }
@@ -523,11 +583,26 @@ impl App {
     }
 
     async fn drop_selected(&mut self, forwards: &Arc<ForwardSet>) {
-        let Some(snap) = self.selected() else { return };
-        let port = snap.local.port();
-        match forwards.remove(port).await {
-            Ok(spec) => self.message = Some(format!("dropped {}", control::display_spec(&spec))),
-            Err(e) => self.message = Some(format!("drop failed: {e:#}")),
+        match self.selected_row() {
+            Some(Selection::Forward(snap)) => {
+                let port = snap.local.port();
+                match forwards.remove(port).await {
+                    Ok(spec) => {
+                        self.message = Some(format!("dropped {}", control::display_spec(&spec)))
+                    }
+                    Err(e) => self.message = Some(format!("drop failed: {e:#}")),
+                }
+            }
+            Some(Selection::Reverse(snap)) => {
+                let spec = snap.spec.to_spec_string();
+                match self.reverse_set.remove(&spec).await {
+                    Ok(dropped) => {
+                        self.message = Some(format!("dropped reverse {}", dropped.to_spec_string()))
+                    }
+                    Err(e) => self.message = Some(format!("drop failed: {e:#}")),
+                }
+            }
+            None => {}
         }
     }
 
@@ -764,7 +839,7 @@ impl App {
                 };
                 rows.push(
                     Row::new(vec![
-                        Cell::from(format!("← R:{}", s.spec.remote_bind_port)),
+                        Cell::from(format!("← {}", s.spec.remote_bind_port)),
                         Cell::from(format!("{}:{}", s.spec.local_host, s.spec.local_port)),
                         Cell::from("—"),
                         Cell::from(ns_disp),
@@ -888,10 +963,13 @@ impl App {
                 cursor,
             ]),
             Mode::ConfirmDrop => {
-                let what = self
-                    .selected()
-                    .map(|s| format!("port {}", s.local.port()))
-                    .unwrap_or_else(|| "selection".into());
+                let what = match self.selected_row() {
+                    Some(Selection::Forward(s)) => format!("port {}", s.local.port()),
+                    Some(Selection::Reverse(s)) => {
+                        format!("reverse R:{}", s.spec.remote_bind_port)
+                    }
+                    None => "selection".into(),
+                };
                 Line::from(Span::styled(format!("drop {what}? (y/n)"), yellow))
             }
             Mode::Picker => Line::from(Span::styled("↑/↓ select  enter forward  esc/f close", dim)),
@@ -919,11 +997,17 @@ impl App {
             .title(" keybindings ");
         let rows = [
             ("a", "add a forward (spec, Enter; prefix -R for reverse)"),
-            ("d / Del", "drop the selected forward (confirm)"),
-            ("o / Enter", "open the forward in a browser"),
-            ("y", "copy the forward's URL to the clipboard"),
-            ("i", "inspect the selected forward (detail + throughput)"),
-            ("v", "toggle visibility (private ↔ exposed)"),
+            (
+                "d / Del",
+                "drop the selected row, forward or reverse (confirm)",
+            ),
+            ("o / Enter", "open the forward in a browser (forwards only)"),
+            (
+                "y",
+                "copy the forward's URL to the clipboard (forwards only)",
+            ),
+            ("i", "inspect the selected row (detail + throughput)"),
+            ("v", "toggle visibility, private ↔ exposed (forwards only)"),
             ("f", "find: pick a discovered port to forward"),
             ("/", "filter the table (Esc clears)"),
             ("PgUp / PgDn", "scroll the log pane"),
@@ -943,10 +1027,18 @@ impl App {
         f.render_widget(Paragraph::new(lines).block(block), area);
     }
 
-    /// Centered detail card for the selected forward: full spec, health, the
-    /// untruncated last error, and a live throughput sparkline.
+    /// Centered detail card for the selected row, dispatching on its direction.
     fn draw_detail(&self, f: &mut ratatui::Frame) {
-        let Some(snap) = self.selected() else { return };
+        match self.selected_row() {
+            Some(Selection::Forward(snap)) => self.draw_forward_detail(f, &snap),
+            Some(Selection::Reverse(snap)) => self.draw_reverse_detail(f, &snap),
+            None => {}
+        }
+    }
+
+    /// Centered detail card for a forward: full spec, health, the untruncated
+    /// last error, and a live throughput sparkline.
+    fn draw_forward_detail(&self, f: &mut ratatui::Frame, snap: &ForwardSnapshot) {
         let area = centered_rect(72, 80, f.area());
         f.render_widget(Clear, area);
         let block = Block::default()
@@ -1015,6 +1107,54 @@ impl App {
             .data(&spark)
             .style(Style::default().fg(Color::Green));
         f.render_widget(sparkline, parts[1]);
+    }
+
+    /// Centered detail card for a reverse forward. No throughput sparkline —
+    /// reverse rates aren't sampled — but cumulative byte counts and health are
+    /// shown.
+    fn draw_reverse_detail(&self, f: &mut ratatui::Frame, snap: &ReverseSnapshot) {
+        let area = centered_rect(72, 80, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" reverse R:{} ", snap.spec.remote_bind_port));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let ns = snap.spec.ns.to_wire();
+        let ns_disp = if ns.is_empty() { "host" } else { &ns };
+        let field = |k: &str, v: String| {
+            Line::from(vec![
+                Span::styled(format!("{k:<13}"), Style::default().fg(Color::Cyan)),
+                Span::raw(v),
+            ])
+        };
+        let mut lines = vec![
+            field("spec:", snap.spec.to_spec_string()),
+            field(
+                "remote bind:",
+                format!(
+                    "{}:{}",
+                    snap.spec.remote_bind_addr, snap.spec.remote_bind_port
+                ),
+            ),
+            field(
+                "local target:",
+                format!("{}:{}", snap.spec.local_host, snap.spec.local_port),
+            ),
+            field("ns:", ns_disp.to_string()),
+            field("origin:", snap.origin.label().to_string()),
+            field("conns:", snap.ok_connections.to_string()),
+            field("to remote:", fmt_bytes(snap.bytes_down)),
+            field("from remote:", fmt_bytes(snap.bytes_up)),
+        ];
+        if let Some(err) = &snap.last_error {
+            lines.push(Line::from(vec![
+                Span::styled("error:       ", Style::default().fg(Color::Red)),
+                Span::styled(err.clone(), Style::default().fg(Color::Red)),
+            ]));
+        }
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
     }
 
     /// Centered picker of discovered-but-unforwarded ports.
@@ -1306,6 +1446,43 @@ mod tests {
         assert_eq!(reverse_flag_rest("3000->3000"), None);
         // The flag must be its own token, not glued to the spec.
         assert_eq!(reverse_flag_rest("-R3000->3000"), None);
+    }
+
+    #[tokio::test]
+    async fn reverse_row_is_selectable_and_droppable() {
+        let reverse_set = Arc::new(ReverseSet::new());
+        reverse_set
+            .add("3000->3000".parse().unwrap(), Origin::UserAdded)
+            .await
+            .unwrap();
+        let mut app = App::new("h".into(), reverse_set.clone());
+        app.status = Status::Connected;
+        app.connected = true;
+        app.forwards = vec![snapshot("8888", "127.0.0.1:8888", Origin::UserAdded)];
+        app.reverse = reverse_set.list().await;
+
+        // The reverse row renders as a dimmed `← R:<port>` row.
+        let text = render(&mut app, 140, 24);
+        assert!(text.contains("← 3000"), "reverse row missing: {text}");
+
+        // Selection spans both rows; index 1 is the reverse forward.
+        assert_eq!(app.selectable_len(), 2);
+        app.table.select(Some(1));
+        assert!(
+            app.reverse_selected(),
+            "row 1 should be the reverse forward"
+        );
+        assert!(matches!(app.selected_row(), Some(Selection::Reverse(_))));
+        // The forward-only accessor is None on a reverse row.
+        assert!(app.selected().is_none());
+
+        // Dropping the selected reverse row removes it from the set.
+        let forwards = Arc::new(ForwardSet::new(crate::client::conn_slot(None).1));
+        app.drop_selected(&forwards).await;
+        assert!(
+            reverse_set.is_empty().await,
+            "reverse forward should be dropped"
+        );
     }
 
     #[test]
