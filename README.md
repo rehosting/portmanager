@@ -49,6 +49,34 @@ $ portmanager status myhost
 $ portmanager stop myhost
 ```
 
+## Install
+
+Install from the published Docker image — no source checkout or Rust toolchain
+needed:
+
+```console
+$ curl -fsSL https://raw.githubusercontent.com/lacraig2/portmanager/main/scripts/install.sh | bash
+```
+
+The image (multi-arch, `lacraig2/portmanager`) carries a static-musl client
+binary plus both bundled Linux agents, and the installer adapts to your OS:
+
+- **Linux** — extracts the static binary into `~/.local/bin/portmanager` and the
+  bundled agents into the dist cache (`~/.cache/portmanager/dist/`). It runs
+  natively afterward; **Docker is not needed at runtime.**
+- **macOS / other** — installs a thin `portmanager` wrapper into `~/.local/bin`
+  that runs the client inside the container (the `docker-run` recipe below).
+  **Docker is required at runtime.**
+
+Override the source image or install dir with `PORTMANAGER_IMAGE` /
+`PORTMANAGER_PREFIX`, or pin a version by passing it as an argument:
+
+```console
+$ curl -fsSL .../scripts/install.sh | bash -s -- lacraig2/portmanager:v0.0.19
+```
+
+Have a checkout? Build from source instead — see [Build](#build).
+
 ## Why
 
 - **mosh can't forward ports** (terminal only), **VSCode forwarding needs
@@ -316,6 +344,10 @@ $ docker run --rm -it --network host \
     -v "$HOME/.ssh:$HOME/.ssh:ro" -e HOME="$HOME" \
     lacraig2/portmanager myhost 8888
 ```
+
+To install a `portmanager` command onto the host straight from this image
+(native binary on Linux, a docker wrapper elsewhere), use the one-liner in
+[Install](#install) — it runs `scripts/install.sh`.
 
 CI builds and pushes a multi-arch manifest (`linux/amd64`, `linux/arm64`) on
 pushes to `main` (`:latest`) and on `vX.Y.Z` tags (versioned), via
