@@ -9,6 +9,9 @@ name: Docker publish
 #
 # Publishes:
 #   :latest        on push to main
+#   :<version>     on push to main, using the SAME next version ci.yml's release
+#                  job computes (reecetech/version-increment), so the image
+#                  version matches the GitHub release cut from the same commit
 #   :<version>     on a vX.Y.Z tag (plus :X.Y and :X)
 #   :sha-<sha>     always
 
@@ -40,6 +43,18 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # On main pushes, compute the next release version the SAME way ci.yml's
+      # release job does (same action + inputs), so the image we tag matches the
+      # GitHub release cut from this commit. ci.yml's release job is gated behind
+      # the slow test+build jobs, so this step reads the same "latest" release
+      # and yields the same next version. Skipped on tag pushes (handled below).
+      - name: Compute release version (main pushes)
+        id: version
+        if: github.ref == 'refs/heads/main'
+        uses: reecetech/version-increment@2023.10.1
+        with:
+          use_api: true
+
       - name: Tags & labels
         id: meta
         uses: docker/metadata-action@v5
@@ -47,6 +62,7 @@ jobs:
           images: lacraig2/portmanager
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.version.outputs.version }},enable=${{ github.ref == 'refs/heads/main' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
