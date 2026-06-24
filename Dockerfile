@@ -61,4 +61,8 @@ FROM alpine:3.20
 RUN apk add --no-cache openssh-client
 COPY --from=builder /out/portmanager /usr/local/bin/portmanager
 COPY --from=builder /out/agents      /usr/local/bin/agents
+# Bake the installer in so the image can install itself onto the host with a
+# single command — no source checkout or GitHub fetch needed:
+#   docker run --rm --entrypoint cat lacraig2/portmanager:latest /install.sh | bash
+COPY scripts/install.sh /install.sh
 ENTRYPOINT ["portmanager"]
