@@ -58,6 +58,13 @@ needed:
 $ curl -fsSL https://raw.githubusercontent.com/lacraig2/portmanager/main/scripts/install.sh | bash
 ```
 
+Already have the image, or prefer not to fetch from GitHub? The installer is
+baked into the image — stream it out and run it (same effect, no GitHub fetch):
+
+```console
+$ docker run --rm --entrypoint cat lacraig2/portmanager:latest /install.sh | bash
+```
+
 The image (multi-arch, `lacraig2/portmanager`) carries a static-musl client
 binary plus both bundled Linux agents, and the installer adapts to your OS:
 
