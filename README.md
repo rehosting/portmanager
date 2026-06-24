@@ -350,8 +350,10 @@ To install a `portmanager` command onto the host straight from this image
 [Install](#install) — it runs `scripts/install.sh`.
 
 CI builds and pushes a multi-arch manifest (`linux/amd64`, `linux/arm64`) on
-pushes to `main` (`:latest`) and on `vX.Y.Z` tags (versioned), via
-`.github/workflows/docker.yml`. That workflow needs two repo secrets:
+pushes to `main` and on `vX.Y.Z` tags, via `.github/workflows/docker.yml`. A
+main push publishes `:latest` **and** `:<version>` — the same next version
+`ci.yml`'s release job computes (`reecetech/version-increment`), so the image
+version matches the GitHub release cut from that commit. That workflow needs two repo secrets:
 `DOCKERHUB_USERNAME` (`lacraig2`) and `DOCKERHUB_TOKEN` (a Docker Hub access
 token). To publish by hand instead: `docker login -u lacraig2 && scripts/pm.sh
 docker-push`.
