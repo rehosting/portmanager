@@ -348,9 +348,12 @@ $ scripts/build-agents.sh          # just the static musl agents, into the dist 
 
 Release packages include the client for one platform plus Linux agents under
 `agents/`, so a Windows or macOS client can still deploy to Linux remotes. The
-client looks for `agents/agent-<triple>` next to itself, then
-`~/.cache/portmanager/dist/agent-<triple>`. `PORTMANAGER_AGENT_BIN` overrides
-both for manual testing.
+client looks for `agents/agent-<triple>` next to itself — following a symlink
+install to the package it points at — then `~/.cache/portmanager/dist/agent-<triple>`
+(and the platform cache dir, `~/Library/Caches/...` on macOS).
+`PORTMANAGER_AGENT_BIN` overrides all of them for manual testing. When no agent
+matches, the error lists every path it searched; `portmanager doctor <host>`
+reports the same check before you connect.
 
 ### Docker
 
