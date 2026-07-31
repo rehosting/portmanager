@@ -69,7 +69,7 @@ build_agent() {
 }
 
 cmd_agents() {
-    local pkg agents_dir built=0
+    local pkg agents_dir built=0 missing=()
     pkg="$(pkg_dir)"
     agents_dir="$pkg/agents"
     mkdir -p "$agents_dir" "$DIST_CACHE"
@@ -80,8 +80,15 @@ cmd_agents() {
             install -m 0755 "target/$triple/release/portmanager" "$DIST_CACHE/agent-$triple"
             log "  -> $agents_dir/agent-$triple"
             built=$((built + 1))
+        else
+            missing+=("$triple")
         fi
     done
+    if [[ "${#missing[@]}" -gt 0 ]]; then
+        warn "no agent built for: ${missing[*]}"
+        warn "  a remote of that arch fails at bootstrap with 'no agent binary for <triple>'."
+        warn "  install a cross toolchain (above) and re-run '$0 agents' to fix it."
+    fi
     if [[ "$built" -eq 0 ]]; then
         warn "no agents were built — packages for Linux remotes will be incomplete."
         warn "the client can still serve a same-arch Linux remote via its own binary."
@@ -176,6 +183,19 @@ cmd_install() {
         log "installed $ver"
     else
         warn "installed, but '$target --version' did not run cleanly"
+    fi
+
+    # Restate any missing agent here: the build's warning scrolls past behind
+    # compiler output, and an agent-less install only fails much later, on the
+    # first connection to a remote of that arch.
+    local miss=() triple
+    for triple in "${AGENT_TARGETS[@]}"; do
+        [[ -x "$DIST_CACHE/agent-$triple" ]] || miss+=("$triple")
+    done
+    if [[ "${#miss[@]}" -gt 0 ]]; then
+        warn "installed without an agent for: ${miss[*]}"
+        warn "  remotes of that arch will fail with 'no agent binary for <triple>'."
+        warn "  fix: cargo install cargo-zigbuild && brew install zig, then '$0 agents'."
     fi
 
     case ":$PATH:" in

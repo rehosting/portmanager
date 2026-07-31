@@ -65,14 +65,71 @@ fn local_arch_token() -> &'static str {
     }
 }
 
+/// Dist cache directories to search, most-likely first.
+///
+/// `scripts/build-agents.sh`, `scripts/pm.sh` and `scripts/install.sh` all write
+/// the XDG path (`$XDG_CACHE_HOME`, else `~/.cache`) on every OS, so that one
+/// comes first. The platform cache dir is also searched because it differs on
+/// macOS (`~/Library/Caches`) — a client that only looked there never saw the
+/// agents the scripts had just installed.
+fn dist_caches() -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    let xdg = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| directories::BaseDirs::new().map(|b| b.home_dir().join(".cache")));
+    out.extend(xdg.map(|p| p.join("portmanager/dist")));
+    if let Some(base) = directories::BaseDirs::new() {
+        let platform = base.cache_dir().join("portmanager/dist");
+        if !out.contains(&platform) {
+            out.push(platform);
+        }
+    }
+    out
+}
+
+/// Agent paths to try for `triple`, in lookup order, given the path we were
+/// invoked as, the path it resolves to (when that differs), and the dist cache.
+///
+/// Pure so the lookup order is testable without touching the filesystem.
+fn agent_candidates(
+    exe: &Path,
+    real: Option<&Path>,
+    caches: &[std::path::PathBuf],
+    triple: &str,
+) -> Vec<std::path::PathBuf> {
+    let exes: Vec<&Path> = std::iter::once(exe).chain(real).collect();
+    let mut out = Vec::new();
+
+    for dir in exes.iter().filter_map(|e| e.parent()) {
+        out.push(dir.join("agents").join(format!("agent-{triple}")));
+        out.push(dir.join(format!("agent-{triple}")));
+    }
+    for cache in caches {
+        out.push(cache.join(format!("agent-{triple}")));
+    }
+    for target_dir in exes.iter().filter_map(|e| {
+        e.ancestors()
+            .find(|p| p.file_name().is_some_and(|n| n == "target"))
+    }) {
+        out.push(target_dir.join(triple).join("release/portmanager"));
+    }
+    out
+}
+
 /// Locate the agent binary to deploy for `triple`, in preference order:
 /// 1. `$PORTMANAGER_AGENT_BIN` (explicit override),
 /// 2. `agents/agent-<triple>` next to this executable (release packages),
 /// 3. `agent-<triple>` next to this executable,
-/// 4. the dist cache (`~/.cache/portmanager/dist/agent-<triple>`, populated by
-///    `scripts/build-agents.sh`),
+/// 4. the dist caches (`~/.cache/portmanager/dist/agent-<triple>` and the
+///    platform cache dir, populated by `scripts/build-agents.sh`),
 /// 5. this workspace's own `target/<triple>/release/portmanager` (dev builds),
 /// 6. our own binary, if the remote arch matches the local one.
+///
+/// Steps 2/3/5 are tried against both the path we were invoked as and the path
+/// it resolves to: a symlink install (`scripts/pm.sh install`) puts the link in
+/// `~/.local/bin` while the package's `agents/` sits beside the real binary, and
+/// `current_exe()` does not resolve symlinks on macOS.
 pub(crate) fn agent_binary_for(triple: &str, remote_arch: &str) -> Result<std::path::PathBuf> {
     if let Ok(p) = std::env::var("PORTMANAGER_AGENT_BIN") {
         let p = std::path::PathBuf::from(p);
@@ -83,44 +140,28 @@ pub(crate) fn agent_binary_for(triple: &str, remote_arch: &str) -> Result<std::p
     }
 
     let exe = std::env::current_exe().context("locating own binary")?;
-    if let Some(exe_dir) = exe.parent() {
-        for packaged in [
-            exe_dir.join("agents").join(format!("agent-{triple}")),
-            exe_dir.join(format!("agent-{triple}")),
-        ] {
-            if packaged.is_file() {
-                return Ok(packaged);
-            }
-        }
-    }
+    let real = std::fs::canonicalize(&exe).ok().filter(|r| *r != exe);
 
-    if let Some(base) = directories::BaseDirs::new() {
-        let dist = base
-            .cache_dir()
-            .join("portmanager/dist")
-            .join(format!("agent-{triple}"));
-        if dist.is_file() {
-            return Ok(dist);
-        }
-    }
-
-    if let Some(target_dir) = exe
-        .ancestors()
-        .find(|p| p.file_name().is_some_and(|n| n == "target"))
-    {
-        let dev = target_dir.join(triple).join("release/portmanager");
-        if dev.is_file() {
-            return Ok(dev);
-        }
+    let tried = agent_candidates(&exe, real.as_deref(), &dist_caches(), triple);
+    if let Some(found) = tried.iter().find(|p| p.is_file()) {
+        return Ok(found.clone());
     }
 
     if remote_arch == local_arch_token() {
         return Ok(exe);
     }
 
+    let searched = tried
+        .iter()
+        .map(|p| format!("\n  {}", p.display()))
+        .collect::<String>();
     bail!(
-        "no agent binary for {triple} (remote arch {remote_arch}, local {}). \
-         Build one with scripts/build-agents.sh or set PORTMANAGER_AGENT_BIN.",
+        "no agent binary for {triple} (remote arch {remote_arch}, local {}).\
+         \nsearched:{searched}\
+         \nfix: build the cross-arch agents with scripts/build-agents.sh (needs a \
+         musl cross toolchain, e.g. `cargo install cargo-zigbuild && brew install zig`), \
+         point PORTMANAGER_AGENT_BIN at an agent-{triple}, or install from the Docker \
+         image (scripts/install.sh), which bundles both Linux agents.",
         local_arch_token()
     )
 }
@@ -533,5 +574,58 @@ mod tests {
         assert!(target_triple("Darwin arm64").is_err());
         assert!(target_triple("Linux riscv64").is_err());
         assert!(target_triple("").is_err());
+    }
+
+    /// A symlink install (`~/.local/bin/portmanager` -> a package dir) must also
+    /// look beside the *resolved* binary, where the package's `agents/` lives.
+    #[test]
+    fn candidates_follow_the_symlink_target() {
+        let exe = Path::new("/home/u/.local/bin/portmanager");
+        let real = Path::new("/src/pm/dist/portmanager-x/portmanager");
+        let caches = [
+            std::path::PathBuf::from("/home/u/.cache/portmanager/dist"),
+            std::path::PathBuf::from("/home/u/Library/Caches/portmanager/dist"),
+        ];
+        let got = agent_candidates(exe, Some(real), &caches, "x86_64-unknown-linux-musl");
+        let got: Vec<String> = got.iter().map(|p| p.display().to_string()).collect();
+        assert_eq!(
+            got,
+            vec![
+                "/home/u/.local/bin/agents/agent-x86_64-unknown-linux-musl",
+                "/home/u/.local/bin/agent-x86_64-unknown-linux-musl",
+                "/src/pm/dist/portmanager-x/agents/agent-x86_64-unknown-linux-musl",
+                "/src/pm/dist/portmanager-x/agent-x86_64-unknown-linux-musl",
+                "/home/u/.cache/portmanager/dist/agent-x86_64-unknown-linux-musl",
+                "/home/u/Library/Caches/portmanager/dist/agent-x86_64-unknown-linux-musl",
+            ]
+        );
+    }
+
+    /// Both cache layouts are searched, XDG first, and never duplicated when
+    /// the platform cache dir is the XDG one (Linux).
+    #[test]
+    fn dist_caches_prefers_xdg_without_duplicates() {
+        let caches = dist_caches();
+        assert!(!caches.is_empty());
+        assert!(caches[0].ends_with("portmanager/dist"));
+        let mut sorted = caches.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            caches.len(),
+            "duplicate cache dirs: {caches:?}"
+        );
+    }
+
+    /// Dev builds resolve through the `target/` ancestor, last.
+    #[test]
+    fn candidates_include_the_dev_target_dir() {
+        let exe = Path::new("/src/pm/target/release/portmanager");
+        let got = agent_candidates(exe, None, &[], "aarch64-unknown-linux-musl");
+        assert_eq!(
+            got.last().unwrap(),
+            Path::new("/src/pm/target/aarch64-unknown-linux-musl/release/portmanager")
+        );
     }
 }
