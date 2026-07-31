@@ -4,8 +4,9 @@ name: Docker publish
 # pushes a multi-arch manifest to Docker Hub.
 #
 # Requires two repository secrets:
-#   DOCKERHUB_USERNAME  -> lacraig2
-#   DOCKERHUB_TOKEN     -> a Docker Hub access token with write on lacraig2/portmanager
+#   DOCKERHUB_USERNAME  -> a Docker Hub account with write access to the
+#                          `rehosting` org (the account, not the org name)
+#   DOCKERHUB_TOKEN     -> that account's access token, with write on rehosting/portmanager
 #
 # Publishes:
 #   :latest        on push to main
@@ -27,7 +28,7 @@ concurrency:
 
 jobs:
   publish:
-    name: Build & push lacraig2/portmanager
+    name: Build & push rehosting/portmanager
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -59,7 +60,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: lacraig2/portmanager
+          images: rehosting/portmanager
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=${{ steps.version.outputs.version }},enable=${{ github.ref == 'refs/heads/main' }}

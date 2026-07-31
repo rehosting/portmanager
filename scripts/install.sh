@@ -3,7 +3,7 @@
 # Docker image*, no source checkout or Rust toolchain required.
 #
 # Quick install (fresh machine):
-#   curl -fsSL https://raw.githubusercontent.com/lacraig2/portmanager/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/rehosting/portmanager/main/scripts/install.sh | bash
 #
 # The published image (see .github/workflows/docker.yml) carries a static-musl
 # client binary plus both bundled Linux agents. How we install depends on the
@@ -24,7 +24,7 @@
 #   XDG_CACHE_HOME      base for the agent cache (default $HOME/.cache)
 set -euo pipefail
 
-IMAGE="${1:-${PORTMANAGER_IMAGE:-lacraig2/portmanager:latest}}"
+IMAGE="${1:-${PORTMANAGER_IMAGE:-rehosting/portmanager:latest}}"
 PREFIX="${PORTMANAGER_PREFIX:-$HOME/.local/bin}"
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/portmanager/dist"
 
