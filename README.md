@@ -55,17 +55,17 @@ Install from the published Docker image — no source checkout or Rust toolchain
 needed:
 
 ```console
-$ curl -fsSL https://raw.githubusercontent.com/lacraig2/portmanager/main/scripts/install.sh | bash
+$ curl -fsSL https://raw.githubusercontent.com/rehosting/portmanager/main/scripts/install.sh | bash
 ```
 
 Already have the image, or prefer not to fetch from GitHub? The installer is
 baked into the image — stream it out and run it (same effect, no GitHub fetch):
 
 ```console
-$ docker run --rm --entrypoint cat lacraig2/portmanager:latest /install.sh | bash
+$ docker run --rm --entrypoint cat rehosting/portmanager:latest /install.sh | bash
 ```
 
-The image (multi-arch, `lacraig2/portmanager`) carries a static-musl client
+The image (multi-arch, `rehosting/portmanager`) carries a static-musl client
 binary plus both bundled Linux agents, and the installer adapts to your OS:
 
 - **Linux** — extracts the static binary into `~/.local/bin/portmanager` and the
@@ -92,7 +92,7 @@ Override the source image or install dir with `PORTMANAGER_IMAGE` /
 `PORTMANAGER_PREFIX`, or pin a version by passing it as an argument:
 
 ```console
-$ curl -fsSL .../scripts/install.sh | bash -s -- lacraig2/portmanager:v0.0.19
+$ curl -fsSL .../scripts/install.sh | bash -s -- rehosting/portmanager:v0.0.19
 ```
 
 Have a checkout? Build from source instead — see [Build](#build).
@@ -319,14 +319,22 @@ from, and also installs the agents into `~/.cache/portmanager/dist/`. Agent
 cross-compilation uses `cargo-zigbuild`, `cross`, or a local `*-linux-musl-gcc`,
 whichever is available (missing toolchains are skipped with a warning).
 
-To put a source build on your PATH, symlink it — rebuilds then propagate with no
-reinstall:
+`install` builds and then puts the client on your PATH:
 
 ```console
-$ ln -sf "$PWD/dist/portmanager-$(rustc -vV | sed -n 's/^host: //p')/portmanager" ~/.local/bin/portmanager
+$ scripts/pm.sh install                    # symlink -> ~/.local/bin/portmanager
+$ scripts/pm.sh install --copy             # detached copy instead of a symlink
+$ scripts/pm.sh install --prefix /usr/local/bin
 ```
 
-On macOS this is worth preferring over the Docker wrapper from
+It symlinks by default, so a later `build` propagates with no reinstall; use
+`--copy` for a checkout you might move or delete. Either way the agents land in
+the dist cache, so the installed client can still deploy to Linux remotes. If
+something that isn't our symlink already sits at the target — an install from
+`scripts/install.sh`, say — it refuses until you pass `--force`, so a Docker
+wrapper is never silently clobbered. `PORTMANAGER_PREFIX` sets the default dir.
+
+On macOS a source install is worth preferring over the Docker wrapper from
 [Install](#install): the client runs natively, so forwards land on your real
 loopback (no VM hop, no `--bind` needed) and the control socket lives on your
 machine, which keeps `status`/`add`/`stop` working from another terminal.
@@ -374,14 +382,14 @@ Multi-arch: `docker buildx build --platform linux/amd64,linux/arm64 .`.
 #### Published image
 
 Released images are pushed to Docker Hub as
-[`lacraig2/portmanager`](https://hub.docker.com/r/lacraig2/portmanager):
+[`rehosting/portmanager`](https://hub.docker.com/r/rehosting/portmanager):
 
 ```console
-$ docker pull lacraig2/portmanager:latest
+$ docker pull rehosting/portmanager:latest
 $ docker run --rm -it --network host \
     --user "$(id -u):$(id -g)" -v /etc/passwd:/etc/passwd:ro \
     -v "$HOME/.ssh:$HOME/.ssh:ro" -e HOME="$HOME" \
-    lacraig2/portmanager myhost 8888
+    rehosting/portmanager myhost 8888
 ```
 
 To install a `portmanager` command onto the host straight from this image
@@ -392,9 +400,10 @@ CI builds and pushes a multi-arch manifest (`linux/amd64`, `linux/arm64`) on
 pushes to `main` and on `vX.Y.Z` tags, via `.github/workflows/docker.yml`. A
 main push publishes `:latest` **and** `:<version>` — the same next version
 `ci.yml`'s release job computes (`reecetech/version-increment`), so the image
-version matches the GitHub release cut from that commit. That workflow needs two repo secrets:
-`DOCKERHUB_USERNAME` (`lacraig2`) and `DOCKERHUB_TOKEN` (a Docker Hub access
-token). To publish by hand instead: `docker login -u lacraig2 && scripts/pm.sh
+version matches the GitHub release cut from that commit. That workflow needs two
+repo secrets: `DOCKERHUB_USERNAME` (a Docker Hub *account* with write access to
+the `rehosting` org — not the org name itself) and `DOCKERHUB_TOKEN` (that
+account's access token). To publish by hand instead: `docker login && scripts/pm.sh
 docker-push`.
 
 ## Test
