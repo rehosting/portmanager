@@ -9,6 +9,10 @@
 #
 # Usage:
 #   scripts/pm.sh build            # client (release) + Linux agents -> package dir
+#   scripts/pm.sh install [OPTS]   # build, then put the client on PATH
+#                                  #   --copy  install a detached copy (default: symlink)
+#                                  #   --prefix DIR  install dir (default ~/.local/bin)
+#                                  #   --force to replace a non-symlink already there
 #   scripts/pm.sh test [ARGS...]   # cargo test (extra args forwarded)
 #   scripts/pm.sh check            # fmt --check + clippy -D warnings + test (CI parity)
 #   scripts/pm.sh run [ARGS...]    # run the packaged client (builds it if missing)
@@ -116,6 +120,72 @@ cmd_run() {
     exec "$client" "$@"
 }
 
+# Install the packaged client onto PATH. Symlinks by default, so later `build`s
+# propagate with no reinstall; `--copy` installs a detached copy for a checkout
+# you might move or delete. Either way the agents `build` laid into the dist
+# cache are found from anywhere, so the installed client can deploy to remotes.
+cmd_install() {
+    local mode=symlink force=0 prefix="${PORTMANAGER_PREFIX:-$HOME/.local/bin}"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --copy)     mode=copy; shift ;;
+            --symlink)  mode=symlink; shift ;;
+            -f|--force) force=1; shift ;;
+            --prefix)   [[ -n "${2:-}" ]] || die "--prefix needs a directory"
+                        prefix="$2"; shift 2 ;;
+            --prefix=*) prefix="${1#--prefix=}"; shift ;;
+            *) die "unknown install option '$1' (try '$0 help')" ;;
+        esac
+    done
+
+    cmd_build
+
+    local pkg client target
+    pkg="$(pkg_dir)"
+    client="$PWD/$pkg/portmanager"
+    [[ -x "$client" ]] || die "no client to install at $client"
+    mkdir -p "$prefix"
+    target="$prefix/portmanager"
+
+    # Look at what's already there before replacing it: a symlink is ours to
+    # repoint, but a real file is some other install (scripts/install.sh's Docker
+    # wrapper, or its native extract) and needs --force to clobber.
+    if [[ -L "$target" ]]; then
+        log "replacing existing symlink -> $(readlink "$target")"
+    elif [[ -e "$target" ]]; then
+        [[ "$force" -eq 1 ]] || {
+            warn "$target exists and is not a symlink — it may be from"
+            warn "  scripts/install.sh (Docker wrapper or native extract)."
+            die "refusing to overwrite; re-run with --force to replace it"
+        }
+        warn "overwriting existing file $target (--force)"
+    fi
+    # Drop the old entry now that it's cleared for replacement. `--copy` onto a
+    # symlink that resolves back to the source would otherwise fail ("identical
+    # file"); on a symlink this unlinks the link, never the build output.
+    rm -f "$target"
+
+    case "$mode" in
+        symlink) ln -sfn "$client" "$target"; log "linked $target -> $client" ;;
+        copy)    install -m 0755 "$client" "$target"; log "copied -> $target" ;;
+    esac
+
+    # Prove the installed path runs before claiming success.
+    local ver
+    if ver="$("$target" --version 2>/dev/null)"; then
+        log "installed $ver"
+    else
+        warn "installed, but '$target --version' did not run cleanly"
+    fi
+
+    case ":$PATH:" in
+        *":$prefix:"*) ;;
+        *) warn "$prefix is not on your PATH — add it, e.g.:"
+           warn "  echo 'export PATH=\"$prefix:\$PATH\"' >> ~/.profile" ;;
+    esac
+    log "try: portmanager --help"
+}
+
 cmd_package() {
     local pkg
     pkg="$(pkg_dir)"
@@ -175,7 +245,7 @@ cmd_docker_run() {
 # Requires `docker login` as an account with push access to REPO.
 cmd_docker_push() {
     command -v docker >/dev/null 2>&1 || die "docker not found"
-    local ref="${1:-lacraig2/portmanager:latest}"
+    local ref="${1:-rehosting/portmanager:latest}"
     [[ "$ref" == *:* ]] || ref="$ref:latest"
     log "building $ref"
     docker build -t "$ref" .
@@ -192,6 +262,7 @@ main() {
     shift || true
     case "$sub" in
         build)   cmd_build "$@" ;;
+        install) cmd_install "$@" ;;
         agents)  cmd_agents "$@" ;;
         test)    cmd_test "$@" ;;
         check)   cmd_check "$@" ;;
