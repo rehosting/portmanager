@@ -158,6 +158,14 @@ cmd_docker_run() {
     if [[ -n "${SSH_AUTH_SOCK:-}" && -S "${SSH_AUTH_SOCK:-}" ]]; then
         args+=(-v "$SSH_AUTH_SOCK:$SSH_AUTH_SOCK" -e "SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
     fi
+    # Colima/Lima "host" is the Linux VM: it re-exposes VM 0.0.0.0 ports on the
+    # Mac's loopback but not VM loopback ports, so default forwards to 0.0.0.0
+    # there. Honor an explicit PORTMANAGER_BIND_ADDR from the environment.
+    if [[ -n "${PORTMANAGER_BIND_ADDR:-}" ]]; then
+        args+=(-e "PORTMANAGER_BIND_ADDR=$PORTMANAGER_BIND_ADDR")
+    elif docker context inspect 2>/dev/null | grep -qiE 'colima|lima'; then
+        args+=(-e PORTMANAGER_BIND_ADDR=0.0.0.0)
+    fi
     log "docker run $DOCKER_IMAGE $*"
     exec docker run "${args[@]}" "$DOCKER_IMAGE" "$@"
 }

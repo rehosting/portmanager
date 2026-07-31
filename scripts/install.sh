@@ -88,9 +88,16 @@ install_wrapper() {
 
     # The image's Linux binary can't run natively on this OS, so the wrapper
     # runs the client in a container with the mounts SSH needs: host networking
-    # (forwarded ports land on host loopback), ~/.ssh read-only, the invoking
+    # (forwarded ports land on the VM's loopback), ~/.ssh read-only, the invoking
     # user + /etc/passwd so SSH key ownership/perm checks pass, and the SSH
     # agent socket when present. Mirrors `scripts/pm.sh docker-run`.
+    #
+    # Under a VM-backed runtime (Colima/Lima) "host" is the Linux VM, not this
+    # Mac. Such runtimes re-expose the VM's *wildcard* (0.0.0.0) listeners on the
+    # Mac's loopback, but never the VM's own loopback listeners — so the wrapper
+    # detects that case at runtime and defaults forwards to 0.0.0.0 (inside the
+    # VM), which lands them back on the Mac's 127.0.0.1. Docker Desktop doesn't
+    # bridge host-network ports either way; prefer the foreground form there.
     cat > "$target" <<WRAPPER
 #!/usr/bin/env bash
 set -euo pipefail
@@ -107,13 +114,26 @@ args=(
 if [[ -n "\${SSH_AUTH_SOCK:-}" && -S "\${SSH_AUTH_SOCK:-}" ]]; then
     args+=(-v "\$SSH_AUTH_SOCK:\$SSH_AUTH_SOCK" -e "SSH_AUTH_SOCK=\$SSH_AUTH_SOCK")
 fi
+# Colima/Lima re-expose VM 0.0.0.0 ports on the Mac's loopback; bind forwards
+# there so they're reachable. Honor an explicit PORTMANAGER_BIND_ADDR if set.
+if [[ -z "\${PORTMANAGER_BIND_ADDR:-}" ]] \\
+   && docker context inspect 2>/dev/null | grep -qiE 'colima|lima'; then
+    args+=(-e PORTMANAGER_BIND_ADDR=0.0.0.0)
+elif [[ -n "\${PORTMANAGER_BIND_ADDR:-}" ]]; then
+    args+=(-e "PORTMANAGER_BIND_ADDR=\$PORTMANAGER_BIND_ADDR")
+fi
 exec docker run "\${args[@]}" "\$IMAGE" "\$@"
 WRAPPER
     chmod 0755 "$target"
 
     log "done. wrapper install — Docker is required at runtime."
-    warn "host networking behaves differently on Docker Desktop (macOS/Windows);"
-    warn "the control socket lives inside the container, so prefer the foreground form."
+    if docker context inspect 2>/dev/null | grep -qiE 'colima|lima'; then
+        log "detected a Colima/Lima Docker context — forwards will bind 0.0.0.0"
+        log "inside the VM and surface on your Mac's 127.0.0.1."
+    else
+        warn "host networking behaves differently on Docker Desktop (macOS/Windows);"
+        warn "the control socket lives inside the container, so prefer the foreground form."
+    fi
     path_hint
     log "try: portmanager --help"
 }

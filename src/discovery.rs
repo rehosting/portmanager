@@ -407,7 +407,7 @@ pub fn spec_for_listener(l: &Listener) -> Result<ForwardSpec> {
         ns,
         remote_host,
         remote_port: l.port,
-        local_addr: std::net::Ipv4Addr::LOCALHOST.into(),
+        local_addr: crate::forward::default_bind(),
         local_port: l.port,
         local_port_auto: true,
         kind: crate::forward::ForwardKind::Direct,

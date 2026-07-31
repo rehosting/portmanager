@@ -27,6 +27,13 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Resolve the process-wide default local bind address before anything parses
+    // a spec (launch args, profiles, control-socket adds, auto-forwards all read
+    // it). `--bind` wins over the env; unset leaves the loopback default.
+    if let Some(addr) = resolve_default_bind(&cli.run)? {
+        portmanager::forward::set_default_bind(addr);
+    }
+
     // Interactive TUI when launching a foreground session attached to a real
     // terminal. Daemon, daemon-child, subcommands, and piped/CI invocations
     // fall back to plain stderr logging. Decided before tracing init so the TUI
@@ -676,6 +683,25 @@ fn daemon_host(args: &cli::RunArgs) -> Result<String> {
         bail!("profile {name:?} has no host and none was given on the CLI");
     }
     bail!("no host given; usage: portmanager --daemon <host> <spec>...");
+}
+
+/// Resolve the default local bind address for forwards: the `--bind` flag if
+/// given, else the `PORTMANAGER_BIND_ADDR` env var, else `None` (loopback).
+/// The env var lets the installer's Docker wrapper opt every invocation
+/// (including `add`) into `0.0.0.0` under a VM-backed runtime like Colima.
+fn resolve_default_bind(run: &cli::RunArgs) -> Result<Option<std::net::IpAddr>> {
+    if let Some(addr) = run.bind {
+        return Ok(Some(addr));
+    }
+    match std::env::var("PORTMANAGER_BIND_ADDR") {
+        Ok(v) if !v.trim().is_empty() => {
+            let addr = v.trim().parse::<std::net::IpAddr>().with_context(|| {
+                format!("PORTMANAGER_BIND_ADDR={v:?} is not a valid IP address")
+            })?;
+            Ok(Some(addr))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Parse a list of forward-spec strings, surfacing the offending spec on error.

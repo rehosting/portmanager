@@ -26,6 +26,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::OnceLock;
 
 use crate::error::SpecError;
 
@@ -158,10 +159,46 @@ impl ForwardSpec {
     }
 }
 
+/// Process-wide default local bind address for forwards whose spec omits an
+/// explicit one. Set once at startup; unset means loopback.
+static DEFAULT_BIND: OnceLock<IpAddr> = OnceLock::new();
+
+/// Configure the process-wide default local bind address (see [`default_bind`]).
+///
+/// Call once at startup, before any spec is parsed. The typical override is
+/// `0.0.0.0`, used when the client runs inside a VM-backed Docker runtime
+/// (Colima/Lima): such runtimes re-expose the VM's *wildcard* listeners on the
+/// host's loopback, but never the VM's own loopback listeners, so a forward has
+/// to bind `0.0.0.0` inside the VM to be reachable from the host.
+pub fn set_default_bind(addr: IpAddr) {
+    let _ = DEFAULT_BIND.set(addr);
+}
+
+/// The configured default local bind address, or loopback when unset.
+///
+/// Used for every forward whose spec doesn't name its own bind address —
+/// launch specs, profile forwards, control-socket `add`s, TUI adds, and
+/// auto-forwarded listeners — so a single startup override covers them all.
+pub fn default_bind() -> IpAddr {
+    DEFAULT_BIND
+        .get()
+        .copied()
+        .unwrap_or(ForwardSpec::DEFAULT_LOCAL_ADDR)
+}
+
 impl FromStr for ForwardSpec {
     type Err = SpecError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
+        Self::parse_with_bind(input, default_bind())
+    }
+}
+
+impl ForwardSpec {
+    /// Parse a forward spec, using `default_bind` for the local listener when
+    /// the spec omits an explicit bind address. [`FromStr`] delegates here with
+    /// the process-wide [`default_bind`].
+    pub fn parse_with_bind(input: &str, default_bind: IpAddr) -> Result<Self, SpecError> {
         let raw = input.trim();
         if raw.is_empty() {
             return Err(SpecError::Empty);
@@ -181,22 +218,29 @@ impl FromStr for ForwardSpec {
         };
 
         // `socks` in the target position requests a dynamic SOCKS5 proxy: there
-        // is no fixed remote target (it comes from each connection's handshake),
-        // and it is loopback-only.
+        // is no fixed remote target (it comes from each connection's handshake).
         if remote_part.eq_ignore_ascii_case(Self::SOCKS_TOKEN) {
             let (local_addr, local_port, local_port_auto) = match local_part {
                 Some(l) => {
                     let (addr, port) = parse_bind_port(l, raw)?;
-                    (addr, port, false)
+                    // A SOCKS proxy relays to the remote's *whole* network, so a
+                    // spec may not expose it directly with an explicit
+                    // non-loopback bind. The configured `default_bind` is
+                    // trusted, though: an operator setting it to `0.0.0.0` for a
+                    // VM Docker runtime only reaches the VM (Lima/Colima re-map
+                    // that to the host's loopback), not the LAN.
+                    if let Some(addr) = addr
+                        && !addr.is_loopback()
+                    {
+                        return Err(SpecError::Malformed(
+                            raw.to_string(),
+                            "a SOCKS proxy is loopback-only; drop the bind address".into(),
+                        ));
+                    }
+                    (addr.unwrap_or(default_bind), port, false)
                 }
-                None => (Self::DEFAULT_LOCAL_ADDR, Self::SOCKS_DEFAULT_PORT, true),
+                None => (default_bind, Self::SOCKS_DEFAULT_PORT, true),
             };
-            if !local_addr.is_loopback() {
-                return Err(SpecError::Malformed(
-                    raw.to_string(),
-                    "a SOCKS proxy is loopback-only; drop the bind address".into(),
-                ));
-            }
             return Ok(ForwardSpec {
                 ns,
                 remote_host: String::new(),
@@ -211,8 +255,11 @@ impl FromStr for ForwardSpec {
         let (remote_host, remote_port) = parse_host_port(remote_part, raw)?;
 
         let (local_addr, local_port) = match local_part {
-            Some(l) => parse_bind_port(l, raw)?,
-            None => (Self::DEFAULT_LOCAL_ADDR, remote_port),
+            Some(l) => {
+                let (addr, port) = parse_bind_port(l, raw)?;
+                (addr.unwrap_or(default_bind), port)
+            }
+            None => (default_bind, remote_port),
         };
 
         Ok(ForwardSpec {
@@ -319,7 +366,10 @@ impl FromStr for ReverseSpec {
             )
         })?;
 
+        // The bind is on the *remote* side, so the local default-bind override
+        // never applies here; an omitted address stays loopback.
         let (remote_bind_addr, remote_bind_port) = parse_bind_port(bind_part.trim(), raw)?;
+        let remote_bind_addr = remote_bind_addr.unwrap_or(ForwardSpec::DEFAULT_LOCAL_ADDR);
         let (local_host, local_port) = parse_host_port(local_part.trim(), raw)?;
 
         Ok(ReverseSpec {
@@ -367,11 +417,12 @@ fn parse_host_port(s: &str, raw: &str) -> Result<(String, u16), SpecError> {
     }
 }
 
-/// Parse the local part `[BINDADDR:]PORT` into a (bind address, port). When no
-/// bind address is given it defaults to loopback. Bracketed IPv6 (`[::]:PORT`)
-/// is supported, mirroring the remote-side host grammar. The bind address is
-/// how "visibility" is expressed: loopback (private) vs `0.0.0.0` (exposed).
-fn parse_bind_port(s: &str, raw: &str) -> Result<(IpAddr, u16), SpecError> {
+/// Parse the local part `[BINDADDR:]PORT` into an (optional bind address, port).
+/// A `None` address means none was given, so the caller substitutes its default
+/// (loopback, or a startup override). Bracketed IPv6 (`[::]:PORT`) is supported,
+/// mirroring the remote-side host grammar. The bind address is how "visibility"
+/// is expressed: loopback (private) vs `0.0.0.0` (exposed).
+fn parse_bind_port(s: &str, raw: &str) -> Result<(Option<IpAddr>, u16), SpecError> {
     let s = s.trim();
     if s.is_empty() {
         return Err(SpecError::MissingPort(raw.to_string()));
@@ -388,13 +439,13 @@ fn parse_bind_port(s: &str, raw: &str) -> Result<(IpAddr, u16), SpecError> {
         let port = rest
             .strip_prefix(':')
             .ok_or_else(|| SpecError::MissingPort(raw.to_string()))?;
-        return Ok((parse_bind_addr(addr, raw)?, parse_port(port, raw)?));
+        return Ok((Some(parse_bind_addr(addr, raw)?), parse_port(port, raw)?));
     }
 
     match s.rsplit_once(':') {
-        // No bind address: bare local port -> loopback.
-        None => Ok((ForwardSpec::DEFAULT_LOCAL_ADDR, parse_port(s, raw)?)),
-        Some((addr, port)) => Ok((parse_bind_addr(addr, raw)?, parse_port(port, raw)?)),
+        // No bind address: bare local port -> caller's default.
+        None => Ok((None, parse_port(s, raw)?)),
+        Some((addr, port)) => Ok((Some(parse_bind_addr(addr, raw)?), parse_port(port, raw)?)),
     }
 }
 
@@ -593,6 +644,48 @@ mod tests {
         let f = parse("socks->[::1]:1080");
         assert_eq!(f.kind, ForwardKind::Socks);
         assert_eq!(f.local_addr, "::1".parse::<IpAddr>().unwrap());
+    }
+
+    // The default-bind override backs the Colima/VM-runtime path: forwards whose
+    // spec omits a bind address adopt it, so a VM `0.0.0.0` listener gets
+    // re-exposed on the host's loopback.
+    const WILDCARD: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+
+    #[test]
+    fn default_bind_applies_when_spec_omits_address() {
+        // Bare port, host:port, and arrowed forms all inherit the default.
+        for spec in ["8080", "192.168.4.2:8080->8080", "db:5432"] {
+            let f = ForwardSpec::parse_with_bind(spec, WILDCARD).unwrap();
+            assert_eq!(f.local_addr, WILDCARD, "spec {spec:?} should adopt default");
+        }
+    }
+
+    #[test]
+    fn explicit_bind_beats_default() {
+        // An address written in the spec always wins over the configured default.
+        let f = ForwardSpec::parse_with_bind("8080->127.0.0.1:8080", WILDCARD).unwrap();
+        assert_eq!(f.local_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn socks_adopts_default_bind() {
+        // Bare `socks` and a port-only `socks->PORT` both take the default bind,
+        // which is how a SOCKS proxy becomes reachable under Colima.
+        for spec in ["socks", "socks->1080"] {
+            let f = ForwardSpec::parse_with_bind(spec, WILDCARD).unwrap();
+            assert!(f.is_socks());
+            assert_eq!(f.local_addr, WILDCARD, "spec {spec:?} should adopt default");
+        }
+    }
+
+    #[test]
+    fn socks_still_rejects_explicit_non_loopback_even_with_default() {
+        // The configured default is trusted, but an address typed into the spec
+        // is not — an explicit wildcard SOCKS bind stays rejected.
+        assert!(matches!(
+            ForwardSpec::parse_with_bind("socks->0.0.0.0:1080", WILDCARD),
+            Err(SpecError::Malformed(..))
+        ));
     }
 
     #[test]
