@@ -59,6 +59,13 @@ pub struct RunArgs {
     #[arg(long)]
     pub via_ssh: bool,
 
+    /// Default local bind address for forwards whose spec omits one (default
+    /// loopback). Set `0.0.0.0` when running inside a VM-backed Docker runtime
+    /// (Colima/Lima): it only re-exposes the VM's wildcard listeners on the
+    /// host's loopback, not the VM's loopback. Also via PORTMANAGER_BIND_ADDR.
+    #[arg(long, value_name = "ADDR")]
+    pub bind: Option<std::net::IpAddr>,
+
     /// How long the remote agent keeps the session alive after the last client
     /// disconnects, before self-reaping (the re-attach window for roaming /
     /// sleeping clients). Accepts `30s`, `15m`, `12h`, `2d` — a bare number is

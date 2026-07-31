@@ -75,6 +75,19 @@ binary plus both bundled Linux agents, and the installer adapts to your OS:
   that runs the client inside the container (the `docker-run` recipe below).
   **Docker is required at runtime.**
 
+On macOS, "host networking" means the *Linux VM's* network, not your Mac's — so
+where forwards land depends on the runtime:
+
+- **Colima / Lima** — the runtime re-exposes the VM's **wildcard** (`0.0.0.0`)
+  listeners on the Mac's `127.0.0.1`, but never the VM's own loopback listeners.
+  The installer detects this context and has the wrapper default forwards to
+  `0.0.0.0` inside the VM (via `PORTMANAGER_BIND_ADDR`), so they show up on your
+  Mac's loopback as expected. Set `PORTMANAGER_BIND_ADDR` yourself to override.
+  Binding `0.0.0.0` here only reaches the VM, not your LAN.
+- **Docker Desktop** — doesn't bridge host-network ports either way, so a
+  backgrounded session's forwards aren't reachable from the Mac. Prefer the
+  foreground form, or publish ports explicitly.
+
 Override the source image or install dir with `PORTMANAGER_IMAGE` /
 `PORTMANAGER_PREFIX`, or pin a version by passing it as an argument:
 
@@ -158,6 +171,13 @@ port is strict and binding fails if it is unavailable. An optional `BINDADDR:`
 before the local port sets the listener's bind address — loopback by default
 (private), or `0.0.0.0` to expose the forward on the LAN. The TUI's `v` key
 toggles this on a live forward.
+
+`--bind ADDR` (or `PORTMANAGER_BIND_ADDR`) changes the *default* bind address
+used by every spec that omits its own `BINDADDR:` — launch specs, profiles,
+control-socket `add`s, TUI adds, and auto-forwarded listeners alike. An address
+written into a spec always wins over the default. This is what makes forwards
+reachable when the client runs inside a VM-backed Docker runtime; see
+[Install](#install).
 
 ### Reverse forwarding (`-R`)
 
