@@ -319,6 +319,18 @@ from, and also installs the agents into `~/.cache/portmanager/dist/`. Agent
 cross-compilation uses `cargo-zigbuild`, `cross`, or a local `*-linux-musl-gcc`,
 whichever is available (missing toolchains are skipped with a warning).
 
+To put a source build on your PATH, symlink it — rebuilds then propagate with no
+reinstall:
+
+```console
+$ ln -sf "$PWD/dist/portmanager-$(rustc -vV | sed -n 's/^host: //p')/portmanager" ~/.local/bin/portmanager
+```
+
+On macOS this is worth preferring over the Docker wrapper from
+[Install](#install): the client runs natively, so forwards land on your real
+loopback (no VM hop, no `--bind` needed) and the control socket lives on your
+machine, which keeps `status`/`add`/`stop` working from another terminal.
+
 Plain cargo still works for a quick same-arch build:
 
 ```console
