@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -21,8 +21,8 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::conn::Conn;
-use crate::error;
-use crate::forward::ForwardSpec;
+use crate::error::{self, SpecError};
+use crate::forward::{ForwardSpec, NsSpec};
 use crate::proto::{self, StreamHeader};
 use crate::socks;
 
@@ -176,14 +176,48 @@ pub struct ActiveForward {
 pub struct ForwardSet {
     slot: ConnSlot,
     active: Mutex<HashMap<u16, ActiveForward>>,
+    /// Session-default namespace for specs that name none (`--ns`, re-pointable
+    /// with `portmanager ns`). It lives here — not in a process-wide global like
+    /// `forward::default_bind` — because it is *mutable* for the session's whole
+    /// life and every later spec (control-socket `add`, TUI `a`) is parsed by
+    /// this session's process against it. A plain `std` lock: reads are short and
+    /// synchronous, so [`ForwardSet::parse_spec`] can stay non-async.
+    default_ns: StdRwLock<Option<NsSpec>>,
 }
 
 impl ForwardSet {
-    pub fn new(slot: ConnSlot) -> Self {
+    /// Create an empty set. `default_ns` is the session-default namespace
+    /// inherited by specs that name none (`None` = the agent's own namespace).
+    pub fn new(slot: ConnSlot, default_ns: Option<NsSpec>) -> Self {
         ForwardSet {
             slot,
             active: Mutex::new(HashMap::new()),
+            default_ns: StdRwLock::new(default_ns.filter(|ns| !ns.is_host())),
         }
+    }
+
+    /// The session-default namespace, if one is set.
+    pub fn default_ns(&self) -> Option<NsSpec> {
+        self.default_ns
+            .read()
+            .expect("default namespace poisoned")
+            .clone()
+    }
+
+    /// Parse a spec string against this session's defaults (namespace + local
+    /// bind address).
+    ///
+    /// Every *late* source of forwards goes through here — the control socket's
+    /// `add` and the TUI's `a` prompt — so inheritance is resolved client-side in
+    /// exactly one place. Resolving it client-side (rather than shipping the
+    /// default to the agent and expanding it there) keeps the agent stateless:
+    /// each stream header already carries its own namespace, so nothing has to be
+    /// re-sent on reconnect or re-bootstrap, an older agent works unchanged, and
+    /// `list`/`status`/the TUI show the namespace a forward *actually* dials in
+    /// instead of a bare spec the agent silently rewrites.
+    pub fn parse_spec(&self, raw: &str) -> Result<ForwardSpec, SpecError> {
+        let default_ns = self.default_ns();
+        ForwardSpec::parse_with_defaults(raw, crate::forward::default_bind(), default_ns.as_ref())
     }
 
     /// Bind and start a forward. Returns the actual local address. Omitted
@@ -267,6 +301,101 @@ impl ForwardSet {
         fwd.task.abort();
         info!(local = %fwd.local, "forward dropped");
         Ok(fwd.spec)
+    }
+
+    /// Point the session default namespace at `ns` and re-point every forward
+    /// that inherited the old one. Returns how many were re-pointed, plus one
+    /// message per forward that could not be rebound.
+    ///
+    /// This is the "the container restarted, its pid changed" path: the whole
+    /// point is not having to drop and re-add each forward by hand. Every forward
+    /// whose spec named no namespace moves — including ones added before any
+    /// default existed, so `portmanager ns` also rescues a session whose bare
+    /// forwards are silently reaching the wrong namespace. Forwards with an
+    /// explicit `NS@`, and auto-forwards built from an observed listener, are left
+    /// alone: those namespaces were stated, not defaulted. Re-pointing rebinds
+    /// (rather than mutating the
+    /// spec in place) because each accept loop owns a clone of its spec; the
+    /// listener's port is preserved so local URLs keep working, and health
+    /// counters restart since the dial path is genuinely new.
+    pub async fn repoint_default_ns(&self, ns: Option<NsSpec>) -> (usize, Vec<String>) {
+        {
+            let mut slot = self.default_ns.write().expect("default namespace poisoned");
+            *slot = ns.filter(|n| !n.is_host());
+        }
+        let effective = self.default_ns().unwrap_or(NsSpec::Host);
+
+        let mut active = self.active.lock().await;
+        let ports: Vec<u16> = active
+            .iter()
+            .filter(|(_, f)| f.spec.ns_inherited && f.spec.ns != effective)
+            .map(|(port, _)| *port)
+            .collect();
+
+        let mut moved = 0;
+        let mut errors = Vec::new();
+        for port in ports {
+            let old = active
+                .remove(&port)
+                .expect("port was listed from this map under the same lock");
+            // Await the aborted accept loop so its listener is really closed
+            // before we rebind the same port.
+            old.task.abort();
+            let _ = old.task.await;
+
+            let mut spec = old.spec.clone();
+            spec.ns = effective.clone();
+            let health = new_health_handle();
+            match bind_forward(self.slot.clone(), spec.clone(), health.clone()).await {
+                Ok((local, task)) => {
+                    spec.local_port = local.port();
+                    active.insert(
+                        local.port(),
+                        ActiveForward {
+                            spec,
+                            local,
+                            origin: old.origin,
+                            health,
+                            task,
+                        },
+                    );
+                    moved += 1;
+                }
+                Err(e) => {
+                    // Put the forward back in its old namespace rather than lose
+                    // it; it still reaches whatever it reached a moment ago.
+                    let health = new_health_handle();
+                    match bind_forward(self.slot.clone(), old.spec.clone(), health.clone()).await {
+                        Ok((local, task)) => {
+                            active.insert(
+                                local.port(),
+                                ActiveForward {
+                                    spec: old.spec,
+                                    local,
+                                    origin: old.origin,
+                                    health,
+                                    task,
+                                },
+                            );
+                            errors.push(format!("local port {port}: {e:#} (kept previous)"));
+                        }
+                        Err(e2) => {
+                            errors
+                                .push(format!("local port {port}: {e:#}; restore failed: {e2:#}"));
+                        }
+                    }
+                }
+            }
+        }
+        if moved > 0 || !errors.is_empty() {
+            info!(
+                ns = %effective.to_wire(),
+                repointed = moved,
+                failed = errors.len(),
+                "session default namespace changed"
+            );
+        }
+        (moved, errors)
     }
 
     /// Stop every forward, returning how many were removed.
@@ -470,6 +599,7 @@ mod tests {
     fn spec(local_port: u16, local_port_auto: bool) -> ForwardSpec {
         ForwardSpec {
             ns: NsSpec::Host,
+            ns_inherited: false,
             remote_host: "127.0.0.1".into(),
             remote_port: local_port,
             local_addr: Ipv4Addr::LOCALHOST.into(),
@@ -507,7 +637,7 @@ mod tests {
         };
         let preferred = busy.local_addr().unwrap().port();
         let (_slot_tx, slot_rx) = conn_slot(None);
-        let forwards = ForwardSet::new(slot_rx);
+        let forwards = ForwardSet::new(slot_rx, None);
 
         let local = forwards
             .add(spec(preferred, true), Origin::UserAdded)
@@ -523,7 +653,7 @@ mod tests {
         let busy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let preferred = busy.local_addr().unwrap().port();
         let (_slot_tx, slot_rx) = conn_slot(None);
-        let forwards = ForwardSet::new(slot_rx);
+        let forwards = ForwardSet::new(slot_rx, None);
 
         let local = forwards
             .add(spec(preferred, true), Origin::UserAdded)
@@ -541,7 +671,7 @@ mod tests {
     #[tokio::test]
     async fn clear_removes_all_forwards() {
         let (_slot_tx, slot_rx) = conn_slot(None);
-        let forwards = ForwardSet::new(slot_rx);
+        let forwards = ForwardSet::new(slot_rx, None);
 
         // Two distinct ephemeral forwards (port 0 -> free port each).
         forwards
@@ -559,11 +689,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn later_adds_inherit_the_session_default_ns_and_are_repointed() {
+        // The `portmanager add` / TUI-`a` path: specs parsed *after* launch must
+        // inherit the session default, and a re-point must follow them.
+        let (_slot_tx, slot_rx) = conn_slot(None);
+        let set = ForwardSet::new(slot_rx, Some(NsSpec::Pid(4242)));
+        assert_eq!(set.default_ns(), Some(NsSpec::Pid(4242)));
+
+        let bare = set.parse_spec("18080").unwrap();
+        assert_eq!(bare.ns, NsSpec::Pid(4242), "bare spec should inherit");
+        assert!(bare.ns_inherited);
+        let bare_local = set.add(bare, Origin::UserAdded).await.unwrap();
+
+        // An explicit namespace still wins, and stays put across re-points.
+        let explicit = set.parse_spec("pid:999@18081").unwrap();
+        assert_eq!(explicit.ns, NsSpec::Pid(999));
+        assert!(!explicit.ns_inherited);
+        let explicit_local = set.add(explicit, Origin::UserAdded).await.unwrap();
+
+        // Re-point: the inherited forward moves, on the same local port.
+        let (moved, errors) = set
+            .repoint_default_ns(Some(NsSpec::Podman("web".into())))
+            .await;
+        assert_eq!((moved, errors.len()), (1, 0));
+        let list = set.list().await;
+        let repointed = find_port(&list, bare_local.port());
+        assert_eq!(repointed.spec.ns, NsSpec::Podman("web".into()));
+        assert!(repointed.spec.ns_inherited, "still an inherited namespace");
+        assert_eq!(
+            find_port(&list, explicit_local.port()).spec.ns,
+            NsSpec::Pid(999),
+            "an explicitly-namespaced forward must not be re-pointed"
+        );
+
+        // Clearing sends inherited forwards back to the agent's own namespace.
+        let (moved, errors) = set.repoint_default_ns(None).await;
+        assert_eq!((moved, errors.len()), (1, 0));
+        assert_eq!(set.default_ns(), None);
+        let list = set.list().await;
+        assert_eq!(find_port(&list, bare_local.port()).spec.ns, NsSpec::Host);
+    }
+
+    #[tokio::test]
+    async fn repoint_rescues_bare_forwards_added_without_any_default() {
+        // The reported case: ports added with no `--ns` at all, silently reaching
+        // the wrong namespace. `portmanager ns` must adopt them.
+        let (_slot_tx, slot_rx) = conn_slot(None);
+        let set = ForwardSet::new(slot_rx, None);
+        let bare = set.parse_spec("18090").unwrap();
+        assert_eq!(bare.ns, NsSpec::Host);
+        let local = set.add(bare, Origin::UserAdded).await.unwrap();
+
+        let (moved, errors) = set.repoint_default_ns(Some(NsSpec::Pid(856_182))).await;
+        assert_eq!((moved, errors.len()), (1, 0));
+        let list = set.list().await;
+        assert_eq!(find_port(&list, local.port()).spec.ns, NsSpec::Pid(856_182));
+    }
+
+    fn find_port(list: &[ForwardSnapshot], port: u16) -> &ForwardSnapshot {
+        list.iter()
+            .find(|s| s.local.port() == port)
+            .expect("forward should still be bound on its original local port")
+    }
+
+    #[tokio::test]
     async fn explicit_local_port_stays_strict_when_busy() {
         let busy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let preferred = busy.local_addr().unwrap().port();
         let (_slot_tx, slot_rx) = conn_slot(None);
-        let forwards = ForwardSet::new(slot_rx);
+        let forwards = ForwardSet::new(slot_rx, None);
 
         assert!(
             forwards

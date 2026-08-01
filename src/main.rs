@@ -147,6 +147,13 @@ async fn run_control_command(cmd: Command) -> Result<()> {
             }
         }
         Command::Clear { host } => (host, vec![Request::Clear]),
+        Command::Ns { host, ns } => {
+            // The session applies (and re-points to) the default; `host`/`none`
+            // parse to `NsSpec::Host`, which clears it.
+            let wire = ns.to_wire();
+            let ns = (!wire.is_empty()).then_some(wire);
+            (host, vec![Request::SetNs { ns }])
+        }
         Command::List { host } => (host, vec![Request::List]),
         Command::Status { host } => (host, vec![Request::Status]),
         Command::Stop { host } => (host, vec![Request::Stop]),
@@ -160,7 +167,12 @@ async fn run_control_command(cmd: Command) -> Result<()> {
     for req in &requests {
         match control::request(&host, req).await? {
             Response::Ok { message } => println!("{message}"),
-            Response::Forwards { entries, reverse } => {
+            Response::Forwards {
+                entries,
+                reverse,
+                default_ns,
+            } => {
+                print_default_ns(&default_ns);
                 print_entries(&entries);
                 print_reverse_entries(&reverse);
             }
@@ -169,11 +181,13 @@ async fn run_control_command(cmd: Command) -> Result<()> {
                 agent_version,
                 entries,
                 reverse,
+                default_ns,
             } => {
                 println!(
                     "session: {state} (agent v{agent_version}, client v{})",
                     env!("CARGO_PKG_VERSION")
                 );
+                print_default_ns(&default_ns);
                 print_entries(&entries);
                 print_reverse_entries(&reverse);
             }
@@ -187,6 +201,16 @@ async fn run_control_command(cmd: Command) -> Result<()> {
         bail!("one or more control requests failed");
     }
     Ok(())
+}
+
+/// Announce the session-default namespace (when set) above the forward table.
+/// Without this, a bare spec that dials inside a container looks identical to one
+/// that dials the remote's own namespace — the ambiguity this feature has to
+/// answer, not create.
+fn print_default_ns(default_ns: &str) {
+    if !default_ns.is_empty() {
+        println!("default namespace: {default_ns} (specs without an NS@ dial inside it)");
+    }
 }
 
 fn print_entries(entries: &[control::ForwardEntry]) {
@@ -268,9 +292,10 @@ async fn run_client(
     log_buf: Option<logbuf::LogBuffer>,
 ) -> Result<()> {
     let tui_mode = log_buf.is_some();
-    // Resolve host, initial forwards, reverse forwards, rules, and the
-    // persistence target from either a named profile or per-host state.
-    let (host, mut forwards, mut reverse_specs, rules, persist, via_ssh) =
+    // Resolve host, the session-default namespace, initial forwards, reverse
+    // forwards, rules, and the persistence target from either a named profile or
+    // per-host state.
+    let (host, default_ns, mut forwards, mut reverse_specs, rules, persist, via_ssh) =
         if let Some(name) = &args.profile {
             let config = tokio::task::spawn_blocking(config::load_config).await??;
             let profile = config
@@ -281,13 +306,16 @@ async fn run_client(
             if host.is_empty() {
                 bail!("profile {name:?} has no host and none was given on the CLI");
             }
-            let mut forwards: Vec<(ForwardSpec, Origin)> = parse_specs(&profile.forwards)
-                .with_context(|| format!("in profile {name:?}"))?
-                .into_iter()
-                .map(|s| (s, Origin::Remembered))
-                .collect();
+            let default_ns =
+                session_default_ns(&args, profile.parsed_default_ns(), &profile.default_ns);
+            let mut forwards: Vec<(ForwardSpec, Origin)> =
+                parse_specs(&profile.forwards, default_ns.as_ref())
+                    .with_context(|| format!("in profile {name:?}"))?
+                    .into_iter()
+                    .map(|s| (s, Origin::Remembered))
+                    .collect();
             forwards.extend(
-                parse_specs(&args.specs)?
+                parse_specs(&args.specs, default_ns.as_ref())?
                     .into_iter()
                     .map(|s| (s, Origin::UserAdded)),
             );
@@ -304,6 +332,7 @@ async fn run_client(
             );
             (
                 host,
+                default_ns,
                 forwards,
                 reverse_specs,
                 profile.autoforward.clone(),
@@ -319,11 +348,14 @@ async fn run_client(
                 let host = host.clone();
                 tokio::task::spawn_blocking(move || config::load_state(&host)).await??
             };
-            let mut forwards: Vec<(ForwardSpec, Origin)> = parse_specs(&args.specs)?
-                .into_iter()
-                .map(|s| (s, Origin::UserAdded))
-                .collect();
-            for remembered in state.parsed_forwards() {
+            let default_ns =
+                session_default_ns(&args, state.parsed_default_ns(), &state.default_ns);
+            let mut forwards: Vec<(ForwardSpec, Origin)> =
+                parse_specs(&args.specs, default_ns.as_ref())?
+                    .into_iter()
+                    .map(|s| (s, Origin::UserAdded))
+                    .collect();
+            for remembered in state.parsed_forwards(default_ns.as_ref()) {
                 if !forwards
                     .iter()
                     .any(|(f, _)| f.local_port == remembered.local_port)
@@ -346,6 +378,7 @@ async fn run_client(
             let via_ssh = args.via_ssh || state.via_ssh;
             (
                 host.clone(),
+                default_ns,
                 forwards,
                 reverse_specs,
                 state.autoforward,
@@ -399,6 +432,17 @@ async fn run_client(
         let _ = tokio::task::spawn_blocking(move || config::remember_via_ssh(&host)).await;
     }
 
+    // Record this session's default namespace (only if it is re-resolvable next
+    // launch — a `pid:` clears it rather than being remembered), so a plain
+    // relaunch keeps namespacing bare specs without waiting for the first
+    // add/drop to trigger persistence.
+    if let config::PersistTarget::HostState { host } = &persist {
+        let (host, ns) = (host.clone(), default_ns.clone());
+        let _ =
+            tokio::task::spawn_blocking(move || config::remember_default_ns(&host, ns.as_ref()))
+                .await;
+    }
+
     let supervisor = Supervisor::start(
         host.clone(),
         args.remote_udp.clone(),
@@ -418,7 +462,15 @@ async fn run_client(
         }
     })?;
 
-    let forward_set = Arc::new(ForwardSet::new(supervisor.slot.clone()));
+    // The session owns the default namespace from here on: later `add`s (control
+    // socket, TUI) parse against it, and `portmanager ns` re-points it.
+    if let Some(ns) = &default_ns {
+        info!(
+            ns = %ns.to_wire(),
+            "default namespace for specs without an NS@ prefix"
+        );
+    }
+    let forward_set = Arc::new(ForwardSet::new(supervisor.slot.clone(), default_ns.clone()));
     for (forward, origin) in forwards {
         forward_set
             .add(forward, origin)
@@ -704,12 +756,42 @@ fn resolve_default_bind(run: &cli::RunArgs) -> Result<Option<std::net::IpAddr>> 
     }
 }
 
+/// Resolve the session-default namespace for a launch: `--ns` wins, otherwise the
+/// one remembered for this host/profile.
+///
+/// `--ns host` (or `none`) parses to [`NsSpec::Host`] and means "no default", so
+/// it also suppresses a remembered one. `stored` is what persistence considered
+/// usable and `stored_raw` what it actually held — they differ when a stale/unsafe
+/// selector was refused, which is worth saying out loud rather than silently
+/// dropping.
+fn session_default_ns(
+    args: &cli::RunArgs,
+    stored: Option<portmanager::forward::NsSpec>,
+    stored_raw: &str,
+) -> Option<portmanager::forward::NsSpec> {
+    if let Some(ns) = &args.ns {
+        return (!ns.is_host()).then(|| ns.clone());
+    }
+    if stored.is_none() && !stored_raw.trim().is_empty() {
+        warn!(
+            "ignoring remembered default namespace {stored_raw:?}: it cannot be re-resolved on a \
+             new session (a PID does not survive a restart, and may have been reused) — pass \
+             --ns again"
+        );
+    }
+    stored
+}
+
 /// Parse a list of forward-spec strings, surfacing the offending spec on error.
-fn parse_specs(specs: &[String]) -> Result<Vec<ForwardSpec>> {
+/// Specs without an `NS@` prefix inherit `default_ns` (the session default).
+fn parse_specs(
+    specs: &[String],
+    default_ns: Option<&portmanager::forward::NsSpec>,
+) -> Result<Vec<ForwardSpec>> {
     specs
         .iter()
         .map(|s| {
-            s.parse::<ForwardSpec>()
+            ForwardSpec::parse_with_defaults(s, portmanager::forward::default_bind(), default_ns)
                 .with_context(|| format!("invalid forward spec {s:?}"))
         })
         .collect()

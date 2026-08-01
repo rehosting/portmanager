@@ -66,12 +66,30 @@ pub struct RunArgs {
     #[arg(long, value_name = "ADDR")]
     pub bind: Option<std::net::IpAddr>,
 
+    /// Default network namespace for every spec that omits its own `NS@` prefix,
+    /// e.g. `--ns pid:856182` or `--ns podman:web`. Covers launch specs, profile
+    /// forwards, later `portmanager add`s and TUI adds alike, so the container is
+    /// named once instead of on every spec. An `NS@` in a spec still wins. Re-point
+    /// a running session with `portmanager ns <host> <ns>`.
+    #[arg(long, value_name = "NS", value_parser = parse_ns)]
+    pub ns: Option<crate::forward::NsSpec>,
+
     /// How long the remote agent keeps the session alive after the last client
     /// disconnects, before self-reaping (the re-attach window for roaming /
     /// sleeping clients). Accepts `30s`, `15m`, `12h`, `2d` — a bare number is
     /// seconds.
     #[arg(long, value_parser = parse_grace, default_value = "12h")]
     pub agent_grace: std::time::Duration,
+}
+
+/// Parse a namespace selector (`pid:1234`, `podman:web`, ...) for `--ns` and the
+/// `ns` subcommand. `host` and `none` mean "no default namespace".
+pub fn parse_ns(s: &str) -> Result<crate::forward::NsSpec, String> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("host") || s.eq_ignore_ascii_case("none") || s.is_empty() {
+        return Ok(crate::forward::NsSpec::Host);
+    }
+    crate::forward::NsSpec::from_wire(s).map_err(|e| e.to_string())
 }
 
 /// Parse a human duration like `30s`, `15m`, `12h`, `2d` into a [`Duration`].
@@ -130,6 +148,21 @@ pub enum Command {
     Clear {
         /// Target host whose session to clear.
         host: String,
+    },
+    /// Re-point the session-default namespace for HOST's running session.
+    ///
+    /// Forwards that inherited the old default are rebound into the new one
+    /// (same local ports); forwards with an explicit `NS@` are left alone. Use
+    /// this when a container is restarted and its PID changes, instead of
+    /// dropping and re-adding every forward. `host`/`none` clears the default.
+    /// `portmanager status|list HOST` shows the current one.
+    Ns {
+        /// Target host whose session to re-point.
+        host: String,
+        /// New namespace selector (`pid:1234`, `podman:web`, ... — or
+        /// `host`/`none` to clear).
+        #[arg(value_parser = parse_ns)]
+        ns: crate::forward::NsSpec,
     },
     /// List active forwards for HOST's running session.
     List {
@@ -222,6 +255,38 @@ mod tests {
         assert!(parse_grace("").is_err());
         assert!(parse_grace("12x").is_err());
         assert!(parse_grace("abc").is_err());
+    }
+
+    #[test]
+    fn parse_ns_selectors() {
+        use crate::forward::NsSpec;
+        assert_eq!(parse_ns("pid:856182").unwrap(), NsSpec::Pid(856_182));
+        assert_eq!(
+            parse_ns("podman:web").unwrap(),
+            NsSpec::Podman("web".into())
+        );
+        // `host`/`none` are the "no default" spellings.
+        assert_eq!(parse_ns("host").unwrap(), NsSpec::Host);
+        assert_eq!(parse_ns("none").unwrap(), NsSpec::Host);
+        assert!(parse_ns("lxc:foo").is_err());
+        assert!(parse_ns("1234").is_err());
+    }
+
+    #[test]
+    fn ns_flag_and_subcommand_parse() {
+        let cli =
+            Cli::try_parse_from(["portmanager", "--ns", "pid:856182", "myhost", "2080"]).unwrap();
+        assert_eq!(cli.run.ns, Some(crate::forward::NsSpec::Pid(856_182)));
+        assert_eq!(cli.run.specs, vec!["2080".to_string()]);
+
+        let cli = Cli::try_parse_from(["portmanager", "ns", "myhost", "podman:web"]).unwrap();
+        match cli.command {
+            Some(Command::Ns { host, ns }) => {
+                assert_eq!(host, "myhost");
+                assert_eq!(ns, crate::forward::NsSpec::Podman("web".into()));
+            }
+            other => panic!("expected the ns subcommand, got {other:?}"),
+        }
     }
 
     #[test]

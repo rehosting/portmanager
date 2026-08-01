@@ -405,6 +405,10 @@ pub fn spec_for_listener(l: &Listener) -> Result<ForwardSpec> {
     let ns = NsSpec::from_wire(&l.ns).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(ForwardSpec {
         ns,
+        // Discovery observed this listener *in* a namespace, so the namespace is
+        // as explicit as if it had been typed: it must not be re-pointed by a
+        // later `portmanager ns`, and it persists in full.
+        ns_inherited: false,
         remote_host,
         remote_port: l.port,
         local_addr: crate::forward::default_bind(),
