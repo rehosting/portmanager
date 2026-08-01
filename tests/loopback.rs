@@ -64,6 +64,7 @@ async fn forwards_bytes_end_to_end() {
     let (_slot_tx, slot_rx) = client::conn_slot(Some(portmanager::conn::Conn::Quic(conn)));
     let forward = ForwardSpec {
         ns: NsSpec::Host,
+        ns_inherited: false,
         remote_host: echo_addr.ip().to_string(),
         remote_port: echo_addr.port(),
         local_addr: Ipv4Addr::LOCALHOST.into(),
@@ -265,6 +266,7 @@ async fn listener_survives_reconnect() {
     let (slot_tx, slot_rx) = client::conn_slot(Some(portmanager::conn::Conn::Quic(conn1.clone())));
     let forward = ForwardSpec {
         ns: NsSpec::Host,
+        ns_inherited: false,
         remote_host: echo_addr.ip().to_string(),
         remote_port: echo_addr.port(),
         local_addr: Ipv4Addr::LOCALHOST.into(),

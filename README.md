@@ -179,6 +179,51 @@ written into a spec always wins over the default. This is what makes forwards
 reachable when the client runs inside a VM-backed Docker runtime; see
 [Install](#install).
 
+`--ns NS` does the same for the *namespace*: it is the default for every spec that
+omits its own `NS@` prefix — see
+[Session default namespace](#session-default-namespace---ns).
+
+### Session default namespace (`--ns`)
+
+Naming a namespace on every spec is noisy, and forgetting it fails *silently*: a
+bare port resolves in the remote's own network namespace, so the forward comes up
+`ok`, the connection count rises, and every request gets `curl: (52) Empty reply
+from server`. `--ns` states the namespace once for the whole session:
+
+```console
+$ portmanager --ns pid:856182 myhost 80 2080 1023   # all three dial inside pid 856182
+$ portmanager add myhost 8080                        # inherits it too — no re-typing
+$ portmanager --ns podman:web myhost 5432 pid:999@80 # 5432 -> web; 80 -> pid 999 (explicit wins)
+```
+
+The default applies to every forward whose spec omits an `NS@` prefix — launch
+specs, profile forwards, control-socket `add`s and ports typed at the TUI's `a`
+prompt alike. An `NS@` written into a spec always wins. `--ns host` (or `none`)
+means "no default". Reverse (`-R`) forwards never inherit it: reverse forwarding
+is host-namespace-only in v1.
+
+The active default is visible in `portmanager status`/`list`, in `doctor`, and in
+the TUI header (`ns pid:856182`); the TUI's detail card (`i`) marks an inherited
+namespace as `(session default)`.
+
+When a container is restarted its PID changes. Re-point a live session instead of
+dropping and re-adding everything:
+
+```console
+$ portmanager ns myhost pid:912004   # re-binds inherited forwards, same local ports
+$ portmanager ns myhost none         # back to the remote's own namespace
+```
+
+A re-point adopts *every* forward whose spec named no namespace — including ones
+added before any default existed, so this also rescues a session whose bare ports
+have been quietly reaching the remote's own namespace. Forwards with an explicit
+`NS@` (and auto-forwards discovered inside a namespace) are left alone. Inherited forwards
+are remembered *without* the namespace, and only a re-resolvable default
+(`podman:`/`docker:`/`netns:`/`nspath:`) is remembered for the next launch —
+never a `pid:`, since a pid does not survive a restart and may have been reused
+by an unrelated process. Pass `--ns` again (or use a container name) for a
+durable default.
+
 ### Reverse forwarding (`-R`)
 
 `-R`/`--reverse` exposes a **local** service **on the remote** — the `ssh -R`
@@ -226,6 +271,7 @@ $ portmanager add   myhost 9000->9000   # bind on the running session, no restar
 $ portmanager drop  myhost 8888         # by spec or local port
 $ portmanager drop  myhost --all        # drop everything (alias: `clear`)
 $ portmanager clear myhost
+$ portmanager ns    myhost pid:912004   # re-point the session default namespace
 $ portmanager list  myhost              # shows per-forward health (ok / last error)
 $ portmanager status myhost             # session state + agent/client versions
 $ portmanager stop  myhost

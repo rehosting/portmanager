@@ -80,12 +80,20 @@ pub async fn run(host: &str) -> Result<()> {
             agent_version,
             entries,
             reverse,
+            default_ns,
         }) => {
             pass(&format!(
                 "running session: {state}; agent v{agent_version}; {} forward(s), {} reverse",
                 entries.len(),
                 reverse.len()
             ));
+            // A session default explains bare specs reaching (or not reaching) a
+            // container, so it belongs in the diagnosis.
+            if !default_ns.is_empty() {
+                note(&format!(
+                    "session default namespace {default_ns}: specs without an NS@ dial inside it"
+                ));
+            }
             if agent_version != env!("CARGO_PKG_VERSION") {
                 note(&format!(
                     "agent is v{agent_version} but this client is v{} — \

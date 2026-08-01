@@ -35,7 +35,7 @@ use tokio::sync::{mpsc, watch};
 use crate::client::{ForwardSet, ForwardSnapshot, Origin};
 use crate::control;
 use crate::discovery::{Listener, spec_for_listener};
-use crate::forward::{ForwardSpec, ReverseSpec};
+use crate::forward::{ForwardSpec, NsSpec, ReverseSpec};
 use crate::logbuf::LogBuffer;
 use crate::reverse::{ReverseSet, ReverseSnapshot};
 use crate::supervisor::Status;
@@ -80,6 +80,7 @@ pub async fn run(
         app.connected = matches!(*status.borrow(), Status::Connected);
         app.status = status.borrow().clone();
         app.agent_version = agent_version.borrow().clone();
+        app.default_ns = forward_set.default_ns();
         app.listeners = discovery_snapshot.borrow().clone();
         app.logs = log_buf.lock().unwrap().iter().cloned().collect();
         app.sample_throughput(Instant::now());
@@ -162,6 +163,9 @@ struct App {
     status: Status,
     connected: bool,
     agent_version: String,
+    /// Session-default namespace, refreshed from the live [`ForwardSet`] each
+    /// tick (it can change under us via `portmanager ns`).
+    default_ns: Option<NsSpec>,
     table: TableState,
     /// Selection within the discovered-ports picker.
     picker: TableState,
@@ -193,6 +197,7 @@ impl App {
             status: Status::Bootstrapping,
             connected: false,
             agent_version: String::new(),
+            default_ns: None,
             table,
             picker,
             mode: Mode::Normal,
@@ -554,7 +559,11 @@ impl App {
             self.add_reverse(rest).await;
             return;
         }
-        let parsed: ForwardSpec = match spec.parse() {
+        // Parse through the set, not `FromStr`: a port typed here with no `NS@`
+        // must inherit the session-default namespace like every other spec. This
+        // is the case the feature exists for — a bare `1080` typed at the `a`
+        // prompt binding fine and reaching nothing.
+        let parsed: ForwardSpec = match forwards.parse_spec(spec) {
             Ok(p) => p,
             Err(e) => {
                 self.message = Some(format!("invalid spec {spec:?}: {e}"));
@@ -755,6 +764,13 @@ impl App {
         } else {
             format!("  agent v{}", self.agent_version)
         };
+        // The session default namespace is shown here because the `a` prompt is
+        // where it silently matters: a bare port typed there dials inside it, and
+        // nothing else on screen would say so.
+        let ns = match &self.default_ns {
+            Some(ns) => format!("  ns {}", ns.to_wire()),
+            None => String::new(),
+        };
         let line = Line::from(vec![
             Span::styled(
                 format!("portmanager  {}  ", self.host),
@@ -762,6 +778,7 @@ impl App {
             ),
             Span::styled(state, Style::default().fg(color)),
             Span::raw(agent),
+            Span::styled(ns, Style::default().fg(Color::Cyan)),
         ]);
         f.render_widget(Paragraph::new(line), area);
     }
@@ -1057,7 +1074,13 @@ impl App {
         let tp = self.throughput.get(&snap.local.port());
         let (ru, rd) = tp.map(|t| (t.rate_up, t.rate_down)).unwrap_or((0.0, 0.0));
         let ns = snap.spec.ns.to_wire();
-        let ns_disp = if ns.is_empty() { "host" } else { &ns };
+        // Say *why* a forward is in a namespace it never named, so this card
+        // answers "the spec is just `2080` — how did it end up in a container?".
+        let ns_disp = match (ns.is_empty(), snap.spec.ns_inherited) {
+            (true, _) => "host".to_string(),
+            (false, true) => format!("{ns} (session default)"),
+            (false, false) => ns.clone(),
+        };
         let field = |k: &str, v: String| {
             Line::from(vec![
                 Span::styled(format!("{k:<9}"), Style::default().fg(Color::Cyan)),
@@ -1075,7 +1098,7 @@ impl App {
                     format!("{}:{}", snap.spec.remote_host, snap.spec.remote_port)
                 },
             ),
-            field("ns:", ns_disp.to_string()),
+            field("ns:", ns_disp.clone()),
             field("origin:", snap.origin.label().to_string()),
             field("conns:", snap.ok_connections.to_string()),
             field(
@@ -1477,11 +1500,36 @@ mod tests {
         assert!(app.selected().is_none());
 
         // Dropping the selected reverse row removes it from the set.
-        let forwards = Arc::new(ForwardSet::new(crate::client::conn_slot(None).1));
+        let forwards = Arc::new(ForwardSet::new(crate::client::conn_slot(None).1, None));
         app.drop_selected(&forwards).await;
         assert!(
             reverse_set.is_empty().await,
             "reverse forward should be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_prompt_inherits_the_session_default_namespace() {
+        // Typing a bare port at the `a` prompt must land in the session's
+        // namespace, and the header must say which one — the silent-failure case.
+        let forwards = Arc::new(ForwardSet::new(
+            crate::client::conn_slot(None).1,
+            Some(NsSpec::Pid(4242)),
+        ));
+        let mut app = App::new("h".into(), Arc::new(ReverseSet::new()));
+        app.default_ns = forwards.default_ns();
+
+        app.add_forward("18099", &forwards).await;
+        let list = forwards.list().await;
+        assert_eq!(list.len(), 1, "add should have bound a forward: {list:?}");
+        assert_eq!(list[0].spec.ns, NsSpec::Pid(4242));
+        assert!(list[0].spec.ns_inherited);
+
+        app.forwards = list;
+        let text = render(&mut app, 140, 24);
+        assert!(
+            text.contains("ns pid:4242"),
+            "header should show the session default: {text}"
         );
     }
 

@@ -85,7 +85,7 @@ async fn socks_proxy_connects_through_agent() {
     let echo = spawn_echo().await;
 
     let (_slot_tx, slot_rx) = conn_slot(Some(portmanager::conn::Conn::Quic(conn)));
-    let forwards = Arc::new(ForwardSet::new(slot_rx));
+    let forwards = Arc::new(ForwardSet::new(slot_rx, None));
 
     // Bind a SOCKS proxy on a known-free loopback port.
     let port = free_port().await;

@@ -80,6 +80,7 @@ async fn agent_binary_bootstraps_and_forwards() {
     let (_slot_tx, slot_rx) = client::conn_slot(Some(portmanager::conn::Conn::Quic(conn)));
     let forward = ForwardSpec {
         ns: NsSpec::Host,
+        ns_inherited: false,
         remote_host: echo_addr.ip().to_string(),
         remote_port: echo_addr.port(),
         local_addr: Ipv4Addr::LOCALHOST.into(),

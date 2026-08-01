@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 use crate::client::ForwardSet;
 use crate::config::PersistTarget;
-use crate::forward::{ForwardSpec, ReverseSpec};
+use crate::forward::{ForwardSpec, NsSpec, ReverseSpec};
 use crate::reverse::{ReverseSet, ReverseSnapshot};
 use crate::supervisor::Status;
 
@@ -42,6 +42,11 @@ pub enum Request {
     },
     /// Remove every forward at once (both directions).
     Clear,
+    /// Re-point the session-default namespace (`portmanager ns <host> <ns>`),
+    /// re-binding the forwards that inherited the old one. `None` clears it.
+    SetNs {
+        ns: Option<String>,
+    },
     List,
     Status,
     Stop,
@@ -58,6 +63,10 @@ pub enum Response {
         /// clients that don't send/expect the field.
         #[serde(default)]
         reverse: Vec<ForwardEntry>,
+        /// Session-default namespace in wire form (empty = none). Reported so
+        /// "why does a bare port work here but not there?" is answerable.
+        #[serde(default)]
+        default_ns: String,
     },
     StatusIs {
         state: String,
@@ -65,6 +74,8 @@ pub enum Response {
         entries: Vec<ForwardEntry>,
         #[serde(default)]
         reverse: Vec<ForwardEntry>,
+        #[serde(default)]
+        default_ns: String,
     },
     Error {
         message: String,
@@ -276,10 +287,20 @@ async fn dispatch(req: Request, ctx: &ControlCtx) -> (Response, bool) {
                 false,
             )
         }
+        Request::SetNs { ns } => match set_default_ns(ns.as_deref(), ctx).await {
+            Ok(msg) => (Response::Ok { message: msg }, false),
+            Err(e) => (
+                Response::Error {
+                    message: format!("{e:#}"),
+                },
+                false,
+            ),
+        },
         Request::List => (
             Response::Forwards {
                 entries: entries(ctx).await,
                 reverse: reverse_entries(ctx).await,
+                default_ns: default_ns_wire(ctx),
             },
             false,
         ),
@@ -296,6 +317,7 @@ async fn dispatch(req: Request, ctx: &ControlCtx) -> (Response, bool) {
                     agent_version,
                     entries: entries(ctx).await,
                     reverse: reverse_entries(ctx).await,
+                    default_ns: default_ns_wire(ctx),
                 },
                 false,
             )
@@ -376,8 +398,54 @@ async fn reverse_entries(ctx: &ControlCtx) -> Vec<ForwardEntry> {
         .collect()
 }
 
+/// The session-default namespace in wire form (empty when none is set).
+fn default_ns_wire(ctx: &ControlCtx) -> String {
+    ctx.forwards
+        .default_ns()
+        .map(|ns| ns.to_wire())
+        .unwrap_or_default()
+}
+
+/// Set (or clear, with `None`) the session-default namespace and re-point the
+/// forwards that inherited the previous one.
+async fn set_default_ns(ns: Option<&str>, ctx: &ControlCtx) -> Result<String> {
+    let parsed = match ns {
+        Some(wire) => {
+            let parsed = NsSpec::from_wire(wire).map_err(|e| anyhow::anyhow!("{e}"))?;
+            (!parsed.is_host()).then_some(parsed)
+        }
+        None => None,
+    };
+    let (moved, errors) = ctx.forwards.repoint_default_ns(parsed.clone()).await;
+    // Persist afterwards: inherited forwards keep their short (namespace-less)
+    // form, and the new default is remembered only if it is re-resolvable.
+    persist(ctx).await;
+
+    let target = match &parsed {
+        Some(ns) => format!("session default namespace is now {}", ns.to_wire()),
+        None => "session default namespace cleared (bare specs dial in the remote's own \
+                 namespace)"
+            .to_string(),
+    };
+    let mut msg = format!("{target}; re-pointed {moved} inherited forward(s)");
+    if !errors.is_empty() {
+        msg.push_str(&format!(
+            " — {} failed: {}",
+            errors.len(),
+            errors.join("; ")
+        ));
+    }
+    Ok(msg)
+}
+
 async fn add_forward(spec: &str, ctx: &ControlCtx) -> Result<std::net::SocketAddr> {
-    let parsed: ForwardSpec = spec.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Parse through the session (not `FromStr`) so a spec with no `NS@` inherits
+    // the session-default namespace — this is what makes `portmanager add <host>
+    // 8080` land in the same namespace as the launch specs.
+    let parsed: ForwardSpec = ctx
+        .forwards
+        .parse_spec(spec)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let local = ctx
         .forwards
         .add(parsed, crate::client::Origin::UserAdded)
@@ -417,6 +485,13 @@ async fn drop_forward(spec: &str, ctx: &ControlCtx) -> Result<String> {
 
 /// Write the live forward and reverse-forward sets back to the persistence
 /// target (host state file or named profile), preserving assignments and rules.
+///
+/// The session-default namespace is remembered only when it is re-resolvable on
+/// the next launch (`podman:`/`docker:`/`netns:`/`nspath:`). A `pid:` default is
+/// deliberately dropped: the pid is gone after a restart, we cannot check a
+/// *remote* pid from here at load time, and pid reuse would silently point
+/// forwards at an unrelated process's namespace. Re-state it with `--ns` (or
+/// `portmanager ns`) instead — that is the trade this feature makes.
 async fn persist(ctx: &ControlCtx) {
     let specs: Vec<String> = ctx
         .forwards
@@ -432,8 +507,14 @@ async fn persist(ctx: &ControlCtx) {
         .into_iter()
         .map(|s| s.spec.to_spec_string())
         .collect();
+    let default_ns = ctx
+        .forwards
+        .default_ns()
+        .filter(|ns| ns.is_stable())
+        .map(|ns| ns.to_wire());
     let target = ctx.persist.clone();
-    let res = tokio::task::spawn_blocking(move || target.save_forwards(specs, reverse)).await;
+    let res =
+        tokio::task::spawn_blocking(move || target.save_forwards(specs, reverse, default_ns)).await;
     match res {
         Ok(Ok(())) => {}
         Ok(Err(e)) => warn!(error = %e, "persistence failed"),
@@ -442,10 +523,21 @@ async fn persist(ctx: &ControlCtx) {
 }
 
 /// Canonical CLI-grammar rendering of a spec (parseable back).
+///
+/// A namespace *inherited* from the session default renders as the short,
+/// namespace-less form — the same reasoning as the auto local port below: the
+/// spec never named a namespace, so persisting the resolved one would freeze it.
+/// For a `pid:` default that is not merely noisy but unsafe (a replayed pid may
+/// belong to something else entirely), and it is what lets `portmanager ns`
+/// re-point these forwards later.
 pub fn display_spec(spec: &ForwardSpec) -> String {
     use std::net::{IpAddr, Ipv4Addr};
 
-    let ns = spec.ns.to_wire();
+    let ns = if spec.ns_inherited {
+        String::new()
+    } else {
+        spec.ns.to_wire()
+    };
     let prefix = if ns.is_empty() {
         String::new()
     } else {
@@ -620,6 +712,7 @@ mod tests {
                 local: "-> 127.0.0.1:3000".into(),
                 health: "idle".into(),
             }],
+            default_ns: "pid:856182".into(),
         };
         let s = serde_json::to_string(&resp).unwrap();
         assert!(matches!(
@@ -673,6 +766,7 @@ mod tests {
         // port at bind time: local_port_auto stays true but local_port != remote.
         let spec = ForwardSpec {
             ns: crate::forward::NsSpec::Host,
+            ns_inherited: false,
             remote_host: "127.0.0.1".into(),
             remote_port: 9001,
             local_addr: std::net::Ipv4Addr::LOCALHOST.into(),
@@ -686,5 +780,30 @@ mod tests {
         let back: ForwardSpec = shown.parse().unwrap();
         assert!(back.local_port_auto, "reparsed spec must stay auto");
         assert_eq!(back.local_port, 9001, "must re-prefer the original port");
+    }
+
+    #[test]
+    fn inherited_namespace_is_not_frozen_on_persist() {
+        // A forward that took the session default persists as the bare spec it
+        // was typed as, so the next launch (or a `portmanager ns`) decides its
+        // namespace again instead of replaying a dead — possibly reused — pid.
+        let spec = ForwardSpec {
+            ns: NsSpec::Pid(856_182),
+            ns_inherited: true,
+            remote_host: "127.0.0.1".into(),
+            remote_port: 2080,
+            local_addr: std::net::Ipv4Addr::LOCALHOST.into(),
+            local_port: 2080,
+            local_port_auto: true,
+            kind: Default::default(),
+        };
+        assert_eq!(display_spec(&spec), "127.0.0.1:2080");
+
+        // An explicitly-namespaced forward still persists in full.
+        let explicit = ForwardSpec {
+            ns_inherited: false,
+            ..spec
+        };
+        assert_eq!(display_spec(&explicit), "pid:856182@127.0.0.1:2080");
     }
 }

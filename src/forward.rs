@@ -22,6 +22,10 @@
 //!
 //! When `->LOCALPORT` is omitted, the local port prefers the remote port and
 //! falls back to an ephemeral free port if that local port is unavailable.
+//!
+//! When `NS@` is omitted, the spec dials in the session's **default namespace**
+//! (`--ns`, or `portmanager ns <host> <ns>` on a live session) — the agent's own
+//! namespace when no default is set. See [`ForwardSpec::parse_with_defaults`].
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
@@ -82,6 +86,25 @@ impl NsSpec {
         matches!(self, NsSpec::Host)
     }
 
+    /// Whether this selector still means the same thing after the remote (or the
+    /// workload inside it) restarts.
+    ///
+    /// Name- and path-based selectors are re-resolved on the remote at dial
+    /// time, so they survive a restart. [`NsSpec::Pid`] does not: the pid is
+    /// gone by the next session and pid reuse would silently dial from an
+    /// unrelated process's namespace. Used to decide what may be *remembered*
+    /// (see `config::HostState::parsed_default_ns`).
+    pub fn is_stable(&self) -> bool {
+        match self {
+            NsSpec::Pid(_) => false,
+            NsSpec::Host
+            | NsSpec::Podman(_)
+            | NsSpec::Docker(_)
+            | NsSpec::Netns(_)
+            | NsSpec::NsPath(_) => true,
+        }
+    }
+
     /// Canonical wire form, matching the CLI grammar. Empty string for the host
     /// namespace; otherwise `<kind>:<value>`.
     pub fn to_wire(&self) -> String {
@@ -121,6 +144,14 @@ pub enum ForwardKind {
 pub struct ForwardSpec {
     /// Namespace the agent dials from.
     pub ns: NsSpec,
+    /// Whether the spec named no namespace, so `ns` follows the session default
+    /// (see [`ForwardSpec::parse_with_defaults`]) — including the "no default set,
+    /// so [`NsSpec::Host`]" case. Mirrors `local_port_auto`: it records that the
+    /// *spec* said nothing, so the short form is what gets persisted and a later
+    /// `portmanager ns` may re-point the forward. Specs built from an observed
+    /// listener (discovery) set this to `false`: their namespace is a fact, not a
+    /// default.
+    pub ns_inherited: bool,
     /// Remote host the agent connects to (resolved inside `ns`). Unused for
     /// [`ForwardKind::Socks`].
     pub remote_host: String,
@@ -199,16 +230,43 @@ impl ForwardSpec {
     /// the spec omits an explicit bind address. [`FromStr`] delegates here with
     /// the process-wide [`default_bind`].
     pub fn parse_with_bind(input: &str, default_bind: IpAddr) -> Result<Self, SpecError> {
+        Self::parse_with_defaults(input, default_bind, None)
+    }
+
+    /// Parse a forward spec against the session's defaults: `default_bind` for an
+    /// omitted local bind address, and `default_ns` for an omitted `NS@` prefix.
+    ///
+    /// `default_ns` is the session-level namespace (`--ns`, or `portmanager ns`
+    /// later): a spec that names no namespace dials inside it instead of the
+    /// remote's own network namespace, which is what makes a bare `2080` reach a
+    /// service inside a container. An `NS@` written into the spec always wins,
+    /// and the inherited case is flagged (`ns_inherited`) so it can be persisted
+    /// short and re-pointed later.
+    pub fn parse_with_defaults(
+        input: &str,
+        default_bind: IpAddr,
+        default_ns: Option<&NsSpec>,
+    ) -> Result<Self, SpecError> {
         let raw = input.trim();
         if raw.is_empty() {
             return Err(SpecError::Empty);
         }
 
         // Split off an optional `NS@` prefix. We split on the *first* `@`; the
-        // namespace selector itself never contains `@`.
-        let (ns, target) = match raw.split_once('@') {
-            Some((ns_part, rest)) => (NsSpec::parse(ns_part)?, rest),
-            None => (NsSpec::Host, raw),
+        // namespace selector itself never contains `@`. With no prefix the
+        // session default applies — this is the single point where inheritance
+        // happens, so launch specs, profile forwards, control-socket `add`s and
+        // TUI adds all get it from one place.
+        let (ns, ns_inherited, target) = match raw.split_once('@') {
+            Some((ns_part, rest)) => (NsSpec::parse(ns_part)?, false, rest),
+            // Flagged as inherited even when there is no default yet: the spec
+            // named no namespace, so it should follow the session default later
+            // too — that is what lets `portmanager ns` fix the bare forwards a
+            // session already has.
+            None => match default_ns {
+                Some(ns) if !ns.is_host() => (ns.clone(), true, raw),
+                _ => (NsSpec::Host, true, raw),
+            },
         };
 
         // Split off an optional `->LOCALPORT` suffix.
@@ -243,6 +301,7 @@ impl ForwardSpec {
             };
             return Ok(ForwardSpec {
                 ns,
+                ns_inherited,
                 remote_host: String::new(),
                 remote_port: 0,
                 local_addr,
@@ -264,6 +323,7 @@ impl ForwardSpec {
 
         Ok(ForwardSpec {
             ns,
+            ns_inherited,
             remote_host,
             remote_port,
             local_addr,
@@ -292,7 +352,9 @@ impl ForwardSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReverseSpec {
     /// Namespace the agent binds the remote listener in. v1 supports
-    /// [`NsSpec::Host`] only.
+    /// [`NsSpec::Host`] only, so the session default namespace deliberately does
+    /// *not* apply here — inheriting it would break every `-R` spec in a session
+    /// launched with `--ns`.
     pub ns: NsSpec,
     /// Address the agent binds on the remote host. Defaults to loopback.
     pub remote_bind_addr: IpAddr,
@@ -686,6 +748,79 @@ mod tests {
             ForwardSpec::parse_with_bind("socks->0.0.0.0:1080", WILDCARD),
             Err(SpecError::Malformed(..))
         ));
+    }
+
+    // --- session default namespace ---------------------------------------
+    //
+    // The default is threaded in as a parameter (not a process global) so these
+    // cases stay independent of each other and of the parse tests above.
+
+    #[test]
+    fn bare_spec_inherits_the_session_default_namespace() {
+        // The launch case: `portmanager --ns pid:856182 host 80 2080` — every
+        // spec that names no namespace dials inside pid 856182.
+        let ns = NsSpec::Pid(856_182);
+        for raw in ["80", "2080", "127.0.0.1:8080->8080", "socks"] {
+            let f = ForwardSpec::parse_with_defaults(raw, default_bind(), Some(&ns)).unwrap();
+            assert_eq!(f.ns, ns, "spec {raw:?} should inherit the default");
+            assert!(f.ns_inherited, "spec {raw:?} should be marked inherited");
+        }
+    }
+
+    #[test]
+    fn explicit_namespace_beats_the_session_default() {
+        // `pid:999@80` means 999 even when the session default is 856182.
+        let f = ForwardSpec::parse_with_defaults(
+            "pid:999@80",
+            default_bind(),
+            Some(&NsSpec::Pid(856_182)),
+        )
+        .unwrap();
+        assert_eq!(f.ns, NsSpec::Pid(999));
+        assert!(!f.ns_inherited, "an explicit namespace is not inherited");
+    }
+
+    #[test]
+    fn bare_spec_without_a_default_stays_in_the_host_namespace() {
+        // Unchanged behaviour when no default is set: the agent's own namespace.
+        // Still flagged as inherited — the spec named no namespace, so a later
+        // `portmanager ns` may re-point it.
+        let f = ForwardSpec::parse_with_defaults("2080", default_bind(), None).unwrap();
+        assert_eq!(f.ns, NsSpec::Host);
+        assert!(f.ns_inherited);
+        // A `host` default is no default at all.
+        let f =
+            ForwardSpec::parse_with_defaults("2080", default_bind(), Some(&NsSpec::Host)).unwrap();
+        assert_eq!(f.ns, NsSpec::Host);
+        assert!(f.ns_inherited);
+    }
+
+    #[test]
+    fn default_namespace_does_not_touch_the_rest_of_the_grammar() {
+        // Inheritance is only about the `NS@` prefix; ports, hosts and binds
+        // parse exactly as before.
+        let f = ForwardSpec::parse_with_defaults(
+            "192.168.4.2:8080->0.0.0.0:9090",
+            default_bind(),
+            Some(&NsSpec::Podman("web".into())),
+        )
+        .unwrap();
+        assert_eq!(f.ns, NsSpec::Podman("web".into()));
+        assert_eq!(f.remote_host, "192.168.4.2");
+        assert_eq!(f.remote_port, 8080);
+        assert_eq!(f.local_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(f.local_port, 9090);
+        assert!(!f.local_port_auto);
+    }
+
+    #[test]
+    fn only_pid_namespaces_are_unstable() {
+        // What may be remembered between sessions (see config::HostState).
+        assert!(!NsSpec::Pid(1234).is_stable());
+        assert!(NsSpec::Podman("web".into()).is_stable());
+        assert!(NsSpec::Docker("api".into()).is_stable());
+        assert!(NsSpec::Netns("blue".into()).is_stable());
+        assert!(NsSpec::NsPath(PathBuf::from("/proc/9/ns/net")).is_stable());
     }
 
     #[test]

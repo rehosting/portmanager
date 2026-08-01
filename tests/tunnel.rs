@@ -85,6 +85,7 @@ async fn tunnel_forwards_bytes_end_to_end() {
     let (_slot_tx, slot_rx) = client::conn_slot(Some(Conn::Ssh(conn)));
     let forward = ForwardSpec {
         ns: NsSpec::Host,
+        ns_inherited: false,
         remote_host: echo_addr.ip().to_string(),
         remote_port: echo_addr.port(),
         local_addr: Ipv4Addr::LOCALHOST.into(),

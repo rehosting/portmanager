@@ -16,6 +16,7 @@ use portmanager::control::{self, ControlCtx, Request, Response};
 use portmanager::crypto::{self, Identity, Timing};
 #[cfg(target_os = "linux")]
 use portmanager::discovery;
+use portmanager::forward::NsSpec;
 use portmanager::supervisor::Status;
 use portmanager::{agent, transport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -64,7 +65,7 @@ async fn control_socket_add_drop_list_status() {
     let echo = spawn_echo().await;
 
     let (_slot_tx, slot_rx) = conn_slot(Some(portmanager::conn::Conn::Quic(conn)));
-    let forwards = Arc::new(ForwardSet::new(slot_rx));
+    let forwards = Arc::new(ForwardSet::new(slot_rx, None));
     let (_status_tx, status_rx) = watch::channel(Status::Connected);
 
     let (_av_tx, av_rx) = watch::channel("test-agent".to_string());
@@ -104,7 +105,9 @@ async fn control_socket_add_drop_list_status() {
     // list shows it
     let resp = control::request(&host, &Request::List).await.unwrap();
     match resp {
-        Response::Forwards { entries, reverse } => {
+        Response::Forwards {
+            entries, reverse, ..
+        } => {
             assert_eq!(entries.len(), 1);
             assert!(entries[0].local.ends_with(&format!(":{port}")));
             assert!(reverse.is_empty());
@@ -120,11 +123,13 @@ async fn control_socket_add_drop_list_status() {
             agent_version,
             entries,
             reverse,
+            default_ns,
         } => {
             assert_eq!(state, "connected");
             assert_eq!(agent_version, "test-agent");
             assert_eq!(entries.len(), 1);
             assert!(reverse.is_empty());
+            assert!(default_ns.is_empty(), "no --ns was given for this session");
         }
         other => panic!("unexpected status response: {other:?}"),
     }
@@ -160,6 +165,132 @@ async fn control_socket_add_drop_list_status() {
     let _ = std::fs::remove_file(portmanager::config::state_path(&host).unwrap());
 }
 
+/// Session-default namespace over the real control socket: a later `add` with no
+/// `NS@` inherits it, an explicit one doesn't, `portmanager ns` re-points only the
+/// inherited forwards, and an unstable (pid) default is never persisted.
+#[tokio::test(flavor = "multi_thread")]
+async fn control_socket_inherits_and_repoints_the_default_namespace() {
+    let host = format!("testns-{}", std::process::id());
+    let conn = session().await;
+
+    let (_slot_tx, slot_rx) = conn_slot(Some(portmanager::conn::Conn::Quic(conn)));
+    // Launch equivalent of `portmanager --ns pid:4242 <host> ...`. The namespace
+    // is only entered when a connection is dialed, so a bogus pid is fine here:
+    // this test is about which namespace each forward *carries*.
+    let forwards = Arc::new(ForwardSet::new(slot_rx, Some(NsSpec::Pid(4242))));
+    let (_status_tx, status_rx) = watch::channel(Status::Connected);
+    let (_av_tx, av_rx) = watch::channel("test-agent".to_string());
+    let reverse = Arc::new(ReverseSet::new());
+    let ctx = ControlCtx {
+        host: host.clone(),
+        forwards: forwards.clone(),
+        reverse: reverse.clone(),
+        status: status_rx,
+        agent_version: av_rx,
+        shutdown: None,
+        persist: portmanager::config::PersistTarget::HostState { host: host.clone() },
+    };
+    let server = tokio::spawn(control::serve(ctx));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let free_port = || async {
+        let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let bare_port = free_port().await;
+    let explicit_port = free_port().await;
+
+    // `portmanager add <host> 9000->PORT`: no namespace named, so it inherits.
+    let resp = control::request(
+        &host,
+        &Request::Add {
+            spec: format!("9000->{bare_port}"),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(resp, Response::Ok { .. }), "add failed: {resp:?}");
+    // ...while an explicit namespace on the spec wins over the default.
+    let resp = control::request(
+        &host,
+        &Request::Add {
+            spec: format!("pid:999@9001->{explicit_port}"),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(resp, Response::Ok { .. }), "add failed: {resp:?}");
+
+    let list = forwards.list().await;
+    let bare = list.iter().find(|s| s.local.port() == bare_port).unwrap();
+    assert_eq!(bare.spec.ns, NsSpec::Pid(4242), "add should inherit --ns");
+    assert!(bare.spec.ns_inherited);
+    let explicit = list
+        .iter()
+        .find(|s| s.local.port() == explicit_port)
+        .unwrap();
+    assert_eq!(explicit.spec.ns, NsSpec::Pid(999));
+    assert!(!explicit.spec.ns_inherited);
+
+    // `list` reports the active default so a bare spec's namespace is visible.
+    match control::request(&host, &Request::List).await.unwrap() {
+        Response::Forwards { default_ns, .. } => assert_eq!(default_ns, "pid:4242"),
+        other => panic!("unexpected list response: {other:?}"),
+    }
+
+    // Persistence: the inherited forward is remembered *without* the namespace,
+    // and a pid default is not remembered at all (it cannot survive a restart).
+    let state = portmanager::config::load_state(&host).unwrap();
+    assert!(
+        state
+            .forwards
+            .contains(&format!("127.0.0.1:9000->{bare_port}")),
+        "inherited forward should persist bare: {:?}",
+        state.forwards
+    );
+    assert!(
+        state
+            .forwards
+            .contains(&format!("pid:999@127.0.0.1:9001->{explicit_port}")),
+        "explicit forward should persist in full: {:?}",
+        state.forwards
+    );
+    assert_eq!(state.default_ns, "", "a pid default must not be remembered");
+
+    // Re-point (`portmanager ns <host> podman:web`): the inherited forward moves
+    // to the new namespace on the same local port, the explicit one does not.
+    let resp = control::request(
+        &host,
+        &Request::SetNs {
+            ns: Some("podman:web".into()),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(resp, Response::Ok { .. }),
+        "ns re-point failed: {resp:?}"
+    );
+    let list = forwards.list().await;
+    let bare = list.iter().find(|s| s.local.port() == bare_port).unwrap();
+    assert_eq!(bare.spec.ns, NsSpec::Podman("web".into()));
+    let explicit = list
+        .iter()
+        .find(|s| s.local.port() == explicit_port)
+        .unwrap();
+    assert_eq!(explicit.spec.ns, NsSpec::Pid(999));
+
+    // A container-name default *is* re-resolvable, so it is remembered.
+    let state = portmanager::config::load_state(&host).unwrap();
+    assert_eq!(state.default_ns, "podman:web");
+
+    server.abort();
+    control::cleanup(&host);
+    let _ = std::fs::remove_file(portmanager::config::state_path(&host).unwrap());
+}
+
 /// Discovery end-to-end against the host namespace: a listener that starts
 /// AFTER the session is up gets auto-forwarded per a matching rule.
 #[cfg(target_os = "linux")]
@@ -169,7 +300,7 @@ async fn discovery_autoforwards_new_listener() {
     let conn = session().await;
 
     let (slot_tx, slot_rx) = conn_slot(Some(portmanager::conn::Conn::Quic(conn)));
-    let forwards = Arc::new(ForwardSet::new(slot_rx.clone()));
+    let forwards = Arc::new(ForwardSet::new(slot_rx.clone(), None));
 
     // Start a listener *after* session start, then a rule that matches it.
     let echo = spawn_echo().await;

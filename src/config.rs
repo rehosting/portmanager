@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::forward::{ForwardSpec, ReverseSpec};
+use crate::forward::{ForwardSpec, NsSpec, ReverseSpec};
 
 /// One auto-forward rule: which discovered listeners to forward automatically.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,16 +75,43 @@ pub struct HostState {
     /// relaunch keeps using the tunnel transport.
     #[serde(default)]
     pub via_ssh: bool,
+    /// Session-default namespace (wire form) the last session ended with, so a
+    /// plain relaunch keeps dialing bare specs inside it. Only *re-resolvable*
+    /// selectors are ever written here; see [`HostState::parsed_default_ns`].
+    #[serde(default)]
+    pub default_ns: String,
 }
 
 impl HostState {
     /// Parse the remembered forward specs, skipping any that no longer parse
-    /// (e.g. written by a newer version).
-    pub fn parsed_forwards(&self) -> Vec<ForwardSpec> {
+    /// (e.g. written by a newer version). Specs with no `NS@` inherit
+    /// `default_ns` — remembered forwards are re-namespaced exactly like launch
+    /// specs, which is the point of persisting the default at all.
+    pub fn parsed_forwards(&self, default_ns: Option<&NsSpec>) -> Vec<ForwardSpec> {
         self.forwards
             .iter()
-            .filter_map(|s| s.parse::<ForwardSpec>().ok())
+            .filter_map(|s| {
+                ForwardSpec::parse_with_defaults(s, crate::forward::default_bind(), default_ns).ok()
+            })
             .collect()
+    }
+
+    /// The remembered session-default namespace, if it is still safe to apply.
+    ///
+    /// Returns `None` for anything unstable ([`NsSpec::is_stable`]) — in practice
+    /// a `pid:` selector. We never write one (see `control::persist`), but a state
+    /// file can be hand-edited or come from another version, and a stale pid is
+    /// worse than no default: pids do not survive a restart and pid reuse would
+    /// quietly dial from an unrelated process's namespace. The client also cannot
+    /// validate a *remote* pid without a session, so refusing it is the only
+    /// honest check available at load time.
+    pub fn parsed_default_ns(&self) -> Option<NsSpec> {
+        let wire = self.default_ns.trim();
+        if wire.is_empty() {
+            return None;
+        }
+        let ns = NsSpec::from_wire(wire).ok()?;
+        (!ns.is_host() && ns.is_stable()).then_some(ns)
     }
 
     /// Parse the remembered reverse-forward specs, skipping any that no longer
@@ -119,6 +146,22 @@ pub struct Profile {
     /// Carry the data plane over SSH (`--via-ssh`) for this profile.
     #[serde(default)]
     pub via_ssh: bool,
+    /// Session-default namespace (wire form) for this profile's forwards. Same
+    /// stability rule as [`HostState::default_ns`].
+    #[serde(default)]
+    pub default_ns: String,
+}
+
+impl Profile {
+    /// The profile's session-default namespace, if usable (see
+    /// [`HostState::parsed_default_ns`]).
+    pub fn parsed_default_ns(&self) -> Option<NsSpec> {
+        HostState {
+            default_ns: self.default_ns.clone(),
+            ..Default::default()
+        }
+        .parsed_default_ns()
+    }
 }
 
 /// Top-level `config.toml`.
@@ -168,13 +211,21 @@ pub enum PersistTarget {
 }
 
 impl PersistTarget {
-    /// Replace the persisted forward and reverse-forward lists.
-    pub fn save_forwards(&self, specs: Vec<String>, reverse: Vec<String>) -> Result<()> {
+    /// Replace the persisted forward and reverse-forward lists, plus the
+    /// session-default namespace (`None` clears it — callers pass `None` for a
+    /// default that must not be remembered, e.g. a `pid:`).
+    pub fn save_forwards(
+        &self,
+        specs: Vec<String>,
+        reverse: Vec<String>,
+        default_ns: Option<String>,
+    ) -> Result<()> {
         match self {
             PersistTarget::HostState { host } => {
                 let mut state = load_state(host)?;
                 state.forwards = specs;
                 state.reverse_forwards = reverse;
+                state.default_ns = default_ns.unwrap_or_default();
                 save_state(host, &state)
             }
             PersistTarget::Profile { name } => {
@@ -185,6 +236,7 @@ impl PersistTarget {
                     .with_context(|| format!("profile {name:?} vanished from config.toml"))?;
                 profile.forwards = specs;
                 profile.reverse_forwards = reverse;
+                profile.default_ns = default_ns.unwrap_or_default();
                 save_config(&config)
             }
         }
@@ -246,6 +298,26 @@ pub fn remember_via_ssh(host: &str) -> Result<()> {
     Ok(())
 }
 
+/// Remember (or clear) the session-default namespace for `host`, so a later plain
+/// `portmanager <host>` keeps dialing bare specs inside it. Best-effort.
+///
+/// Only re-resolvable selectors are stored — a `pid:` default clears the stored
+/// value instead of replacing it, because remembering a pid is unsafe (see
+/// [`HostState::parsed_default_ns`]) and leaving a *stale name* behind would be a
+/// lie about what this session is doing. Mirrors [`remember_via_ssh`].
+pub fn remember_default_ns(host: &str, ns: Option<&NsSpec>) -> Result<()> {
+    let wire = ns
+        .filter(|ns| ns.is_stable() && !ns.is_host())
+        .map(|ns| ns.to_wire())
+        .unwrap_or_default();
+    let mut state = load_state(host)?;
+    if state.default_ns != wire {
+        state.default_ns = wire;
+        save_state(host, &state)?;
+    }
+    Ok(())
+}
+
 /// Make a host string filesystem-safe.
 fn sanitize(host: &str) -> String {
     host.chars()
@@ -300,7 +372,43 @@ mod tests {
         assert_eq!(back.forwards, st.forwards);
         assert_eq!(back.assignments, st.assignments);
         assert_eq!(back.autoforward, st.autoforward);
-        assert_eq!(back.parsed_forwards().len(), 1);
+        assert_eq!(back.parsed_forwards(None).len(), 1);
+    }
+
+    #[test]
+    fn remembered_forwards_inherit_a_remembered_default_ns() {
+        let mut st = HostState::default();
+        st.forwards.push("2080".into()); // bare: written by an inherited forward
+        st.forwards.push("pid:999@80".into()); // explicit: must stay put
+        st.default_ns = "podman:web".into();
+
+        let ns = st.parsed_default_ns().expect("podman default is stable");
+        assert_eq!(ns, NsSpec::Podman("web".into()));
+        let parsed = st.parsed_forwards(Some(&ns));
+        assert_eq!(parsed[0].ns, ns, "bare spec should adopt the default");
+        assert!(parsed[0].ns_inherited);
+        assert_eq!(parsed[1].ns, NsSpec::Pid(999), "explicit spec is untouched");
+        assert!(!parsed[1].ns_inherited);
+    }
+
+    #[test]
+    fn remembered_pid_default_ns_is_refused() {
+        // A pid cannot survive a restart and may have been reused, so a state
+        // file carrying one (hand-edited, or from another version) is ignored.
+        let st = HostState {
+            default_ns: "pid:856182".into(),
+            ..Default::default()
+        };
+        assert_eq!(st.parsed_default_ns(), None);
+
+        // Garbage and the explicit host namespace are also "no default".
+        for wire in ["", "lxc:foo", "host"] {
+            let st = HostState {
+                default_ns: wire.into(),
+                ..Default::default()
+            };
+            assert_eq!(st.parsed_default_ns(), None, "{wire:?} should not apply");
+        }
     }
 
     #[test]
