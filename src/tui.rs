@@ -54,6 +54,7 @@ pub async fn run(
     log_buf: LogBuffer,
     discovery_snapshot: watch::Receiver<Vec<Listener>>,
     mut shutdown_rx: mpsc::UnboundedReceiver<()>,
+    via_ssh: bool,
 ) -> Result<()> {
     install_panic_hook();
     let mut terminal = setup_terminal()?;
@@ -71,6 +72,7 @@ pub async fn run(
     });
 
     let mut app = App::new(host, reverse_set.clone());
+    app.via_ssh = via_ssh;
     let mut tick = tokio::time::interval(Duration::from_millis(250));
 
     loop {
@@ -175,6 +177,11 @@ struct App {
     throughput: HashMap<u16, PortThroughput>,
     /// Transient feedback shown in the footer (errors, confirmations).
     message: Option<String>,
+    /// Whether the data plane is the SSH tunnel rather than direct QUIC. The
+    /// tunnel is much slower (every forward shares one TCP connection) and is
+    /// remembered per host, so the header calls it out rather than leaving it
+    /// to be discovered from the state file.
+    via_ssh: bool,
 }
 
 impl App {
@@ -201,6 +208,7 @@ impl App {
             log_scroll: 0,
             throughput: HashMap::new(),
             message: None,
+            via_ssh: false,
         }
     }
 
@@ -755,6 +763,18 @@ impl App {
         } else {
             format!("  agent v{}", self.agent_version)
         };
+        // The transport is the single biggest performance difference in the
+        // session, so name it in the header instead of leaving it implicit.
+        let transport = if self.via_ssh {
+            Span::styled(
+                "  SSH TUNNEL — not QUIC",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled("  quic", Style::default().fg(Color::DarkGray))
+        };
         let line = Line::from(vec![
             Span::styled(
                 format!("portmanager  {}  ", self.host),
@@ -762,6 +782,7 @@ impl App {
             ),
             Span::styled(state, Style::default().fg(color)),
             Span::raw(agent),
+            transport,
         ]);
         f.render_widget(Paragraph::new(line), area);
     }
@@ -1482,6 +1503,29 @@ mod tests {
         assert!(
             reverse_set.is_empty().await,
             "reverse forward should be dropped"
+        );
+    }
+
+    #[test]
+    fn header_names_the_transport() {
+        // The SSH tunnel is much slower than QUIC and is remembered per host,
+        // so a tunnelled session has to say so rather than looking identical.
+        let mut app = App::new("myhost".into(), Arc::new(ReverseSet::new()));
+        app.status = Status::Connected;
+        app.connected = true;
+
+        let text = render(&mut app, 140, 24);
+        assert!(text.contains("quic"), "direct session should name QUIC: {text}");
+        assert!(
+            !text.contains("SSH TUNNEL"),
+            "direct session must not warn: {text}"
+        );
+
+        app.via_ssh = true;
+        let text = render(&mut app, 140, 24);
+        assert!(
+            text.contains("SSH TUNNEL — not QUIC"),
+            "tunnelled session must say so plainly: {text}"
         );
     }
 

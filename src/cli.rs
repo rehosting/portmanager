@@ -55,9 +55,16 @@ pub struct RunArgs {
 
     /// Carry the data plane over SSH (`ssh -L`) instead of a direct QUIC/UDP
     /// channel. Use for hosts reachable only through a jump host (ProxyJump)
-    /// with no direct UDP path. Remembered per host once used.
-    #[arg(long)]
+    /// with no direct UDP path. Remembered per host once used; undo with
+    /// `--no-via-ssh`.
+    #[arg(long, overrides_with = "no_via_ssh")]
     pub via_ssh: bool,
+
+    /// Force the direct QUIC/UDP data plane, clearing any remembered
+    /// `--via-ssh` choice for this host. The tunnel transport is sticky once
+    /// used, so this is how you get a host back onto QUIC.
+    #[arg(long, overrides_with = "via_ssh")]
+    pub no_via_ssh: bool,
 
     /// Default local bind address for forwards whose spec omits one (default
     /// loopback). Set `0.0.0.0` when running inside a VM-backed Docker runtime

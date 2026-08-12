@@ -308,7 +308,7 @@ async fn run_client(
                 reverse_specs,
                 profile.autoforward.clone(),
                 config::PersistTarget::Profile { name: name.clone() },
-                args.via_ssh || profile.via_ssh,
+                !args.no_via_ssh && (args.via_ssh || profile.via_ssh),
             )
         } else {
             let host = args
@@ -343,7 +343,7 @@ async fn run_client(
                     reverse_specs.push((remembered, Origin::Remembered));
                 }
             }
-            let via_ssh = args.via_ssh || state.via_ssh;
+            let via_ssh = !args.no_via_ssh && (args.via_ssh || state.via_ssh);
             (
                 host.clone(),
                 forwards,
@@ -393,10 +393,32 @@ async fn run_client(
         );
     }
 
-    // Remember the tunnel choice so a later plain `portmanager <host>` keeps it.
-    if via_ssh && let config::PersistTarget::HostState { host } = &persist {
+    // Remember the tunnel choice so a later plain `portmanager <host>` keeps it,
+    // and clear it again on an explicit `--no-via-ssh` so the choice is
+    // reversible (otherwise one `--via-ssh` pins the host to the slower
+    // transport forever).
+    if let config::PersistTarget::HostState { host } = &persist {
         let host = host.clone();
-        let _ = tokio::task::spawn_blocking(move || config::remember_via_ssh(&host)).await;
+        if via_ssh {
+            let _ = tokio::task::spawn_blocking(move || config::remember_via_ssh(&host)).await;
+        } else if args.no_via_ssh {
+            let cleared =
+                tokio::task::spawn_blocking(move || config::forget_via_ssh(&host)).await;
+            if let Ok(Ok(true)) = cleared {
+                info!("cleared the remembered --via-ssh choice; using the direct QUIC data plane");
+            }
+        }
+    }
+
+    // The transport is a large performance difference and was previously only
+    // discoverable by inspecting the state file, so state it outright.
+    if via_ssh {
+        info!(
+            "data plane: SSH tunnel (ssh -L) — all forwards share one TCP \
+             connection; pass --no-via-ssh to use direct QUIC"
+        );
+    } else {
+        info!("data plane: direct QUIC/UDP");
     }
 
     let supervisor = Supervisor::start(
@@ -475,6 +497,7 @@ async fn run_client(
             log_buf,
             snapshot_rx.expect("tui mode always has a discovery snapshot channel"),
             shutdown_rx,
+            via_ssh,
         )
         .await;
         control_task.abort();

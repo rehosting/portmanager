@@ -246,6 +246,22 @@ pub fn remember_via_ssh(host: &str) -> Result<()> {
     Ok(())
 }
 
+/// Clear a remembered SSH-tunnel choice for `host`, so a later plain
+/// `portmanager <host>` goes back to the direct QUIC/UDP data plane.
+///
+/// The counterpart to [`remember_via_ssh`]: without this, one `--via-ssh`
+/// launch pins a host to the tunnel transport permanently. Returns whether the
+/// flag had been set. Best-effort.
+pub fn forget_via_ssh(host: &str) -> Result<bool> {
+    let mut state = load_state(host)?;
+    if state.via_ssh {
+        state.via_ssh = false;
+        save_state(host, &state)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Make a host string filesystem-safe.
 fn sanitize(host: &str) -> String {
     host.chars()
