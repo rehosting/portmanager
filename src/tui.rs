@@ -1515,7 +1515,10 @@ mod tests {
         app.connected = true;
 
         let text = render(&mut app, 140, 24);
-        assert!(text.contains("quic"), "direct session should name QUIC: {text}");
+        assert!(
+            text.contains("quic"),
+            "direct session should name QUIC: {text}"
+        );
         assert!(
             !text.contains("SSH TUNNEL"),
             "direct session must not warn: {text}"

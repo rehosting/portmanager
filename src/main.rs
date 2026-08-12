@@ -402,8 +402,7 @@ async fn run_client(
         if via_ssh {
             let _ = tokio::task::spawn_blocking(move || config::remember_via_ssh(&host)).await;
         } else if args.no_via_ssh {
-            let cleared =
-                tokio::task::spawn_blocking(move || config::forget_via_ssh(&host)).await;
+            let cleared = tokio::task::spawn_blocking(move || config::forget_via_ssh(&host)).await;
             if let Ok(Ok(true)) = cleared {
                 info!("cleared the remembered --via-ssh choice; using the direct QUIC data plane");
             }
