@@ -176,6 +176,19 @@ impl Timing {
         tc.keep_alive_interval(Some(self.keep_alive));
         let idle = quinn::IdleTimeout::try_from(self.max_idle).context("idle timeout too large")?;
         tc.max_idle_timeout(Some(idle));
+
+        // Congestion control: BBR, not quinn's default Cubic.
+        //
+        // portmanager's whole premise is links that lose packets — Wi-Fi
+        // roaming, VPNs, cellular. Cubic treats every loss as congestion and
+        // backs off, so its throughput falls off roughly as 1/sqrt(loss_rate)
+        // regardless of how much bandwidth is actually free. On a measured path
+        // carrying ~1.2 MB/s with ~6% loss at saturation, Cubic delivered
+        // 0.21 MB/s — about a sixth of the link. BBR models the bottleneck's
+        // bandwidth and RTT instead of reading loss as a stop sign, which is
+        // the right trade for exactly these links.
+        tc.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+
         Ok(tc)
     }
 }
