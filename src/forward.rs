@@ -157,6 +157,25 @@ impl ForwardSpec {
     pub fn local_key(&self) -> (IpAddr, u16) {
         (self.local_addr, self.local_port)
     }
+
+    /// Identity used to collapse duplicates in a launch's forward list, where
+    /// CLI specs, profile entries, and remembered state are merged.
+    ///
+    /// A spec that omits its local port only says "forward this target", so two
+    /// such specs are the same forward and the later one is dropped — that is
+    /// how a CLI spec supersedes a remembered entry. A spec that *names* a
+    /// local port is a distinct binding even when it shares a target, so
+    /// `host:80->1080` and `host:80->2080` both survive. Keying on the target
+    /// alone would silently drop the second.
+    pub fn dedup_key(&self) -> (String, String, u16, Option<(IpAddr, u16)>) {
+        let local = (!self.local_port_auto).then_some((self.local_addr, self.local_port));
+        (
+            self.ns.to_wire(),
+            self.remote_host.clone(),
+            self.remote_port,
+            local,
+        )
+    }
 }
 
 /// Process-wide default local bind address for forwards whose spec omits an
@@ -686,6 +705,53 @@ mod tests {
             ForwardSpec::parse_with_bind("socks->0.0.0.0:1080", WILDCARD),
             Err(SpecError::Malformed(..))
         ));
+    }
+
+    /// Apply the launch-time dedup exactly as `main` does.
+    fn dedup(specs: &[&str]) -> Vec<ForwardSpec> {
+        let mut seen = std::collections::HashSet::new();
+        specs
+            .iter()
+            .map(|s| parse(s))
+            .filter(|f| seen.insert(f.dedup_key()))
+            .collect()
+    }
+
+    #[test]
+    fn dedup_keeps_distinct_local_ports_for_one_target() {
+        // Two explicit local ports onto the same remote target are two real
+        // bindings; keying dedup on the target alone silently dropped one.
+        let kept = dedup(&["192.168.4.2:80->1080", "192.168.4.2:80->2080"]);
+        assert_eq!(kept.len(), 2, "both bindings must survive: {kept:?}");
+        assert_eq!(kept[0].local_port, 1080);
+        assert_eq!(kept[1].local_port, 2080);
+    }
+
+    #[test]
+    fn dedup_collapses_repeated_auto_specs() {
+        // Both omit the local port, so they mean the same thing — the later
+        // (remembered) copy drops and the first (CLI) one wins.
+        let kept = dedup(&["db.internal:5432", "db.internal:5432"]);
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].local_port_auto);
+    }
+
+    #[test]
+    fn dedup_separates_auto_from_pinned() {
+        // "forward this target" and "forward it to exactly this port" are
+        // different requests even though they share a target.
+        let kept = dedup(&["db.internal:5432", "db.internal:5432->15432"]);
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn dedup_respects_namespace_and_bind_address() {
+        // Same target and local port, different namespace -> distinct.
+        let kept = dedup(&["podman:web@80->8080", "80->8080"]);
+        assert_eq!(kept.len(), 2);
+        // Same target and port, different bind address -> distinct bindings.
+        let kept = dedup(&["80->127.0.0.1:8080", "80->0.0.0.0:8080"]);
+        assert_eq!(kept.len(), 2);
     }
 
     #[test]

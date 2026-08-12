@@ -354,13 +354,14 @@ async fn run_client(
             )
         };
 
-    // Dedup by remote target (CLI specs win over profile/state entries). Local
-    // port conflicts are resolved while binding so omitted local ports can
-    // fall back instead of being discarded here.
+    // Dedup merged specs (CLI wins over profile/state entries). See
+    // `ForwardSpec::dedup_key`: specs that pin a local port stay distinct even
+    // when they share a remote target. Local port conflicts are resolved while
+    // binding so omitted local ports can fall back instead of being discarded
+    // here.
     {
         let mut seen = std::collections::HashSet::new();
-        forwards
-            .retain(|(f, _)| seen.insert((f.ns.to_wire(), f.remote_host.clone(), f.remote_port)));
+        forwards.retain(|(f, _)| seen.insert(f.dedup_key()));
     }
     // Dedup reverse forwards by remote bind endpoint (CLI wins over remembered).
     {
