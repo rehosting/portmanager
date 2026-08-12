@@ -190,7 +190,13 @@ impl Drop for SshConn {
 }
 
 /// Write the per-connection preamble: 32 token bytes then a one-byte opcode.
+///
+/// Every tunnel connection opens this way — forwarded stream, keepalive, and
+/// shutdown alike — so it is also where Nagle gets turned off. These sockets
+/// carry the forwarded payload (or a latency-sensitive liveness signal), and
+/// the preamble is itself a small write followed immediately by more.
 async fn write_preamble(tcp: &mut TcpStream, token: &Token, opcode: u8) -> std::io::Result<()> {
+    crate::proto::disable_nagle(tcp);
     tcp.write_all(token.as_bytes()).await?;
     tcp.write_u8(opcode).await?;
     tcp.flush().await?;

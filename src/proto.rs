@@ -108,10 +108,18 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
+    // Every forwarded payload socket reaches the wire through here, so this is
+    // the one place Nagle has to be turned off.
+    disable_nagle(&tcp);
+
     let (tcp_read, tcp_write) = tcp.into_split();
     let mut tcp_read = Counted::new(tcp_read, bytes_up);
     let mut tcp_write = Counted::new(tcp_write, bytes_down);
 
+    // These use tokio's default 8 KiB copy buffer. Raising it to 64 KiB was
+    // measured against `tests/throughput.rs` and made no difference (63.2 vs
+    // 63.9 MiB/s median on loopback), so the chunk size is not what bounds a
+    // forward — the QUIC crypto and packet path are. Left alone deliberately.
     let upstream = async {
         tokio::io::copy(&mut tcp_read, &mut send).await?;
         let _ = send.shutdown().await;
@@ -125,6 +133,25 @@ where
 
     tokio::try_join!(upstream, downstream)?;
     Ok(())
+}
+
+/// Disable Nagle's algorithm on a socket carrying forwarded traffic.
+///
+/// The splice hands the peer's bytes on in whatever chunks it read them, so a
+/// single application write often reaches the socket as a small segment
+/// followed by more. Nagle holds that second segment until the first is
+/// ACKed, and delayed-ACK on the far side won't send that ACK immediately —
+/// the pair costs up to ~40ms per exchange on a request/response protocol.
+/// A forward has two TCP hops (client-side accept and agent-side dial), so
+/// the penalty applies twice. OpenSSH sets `TCP_NODELAY` on forwarded
+/// channels for exactly this reason.
+///
+/// Best-effort: a socket that rejects the option still works, just slower, so
+/// this never fails a connection.
+pub(crate) fn disable_nagle(tcp: &TcpStream) {
+    if let Err(e) = tcp.set_nodelay(true) {
+        tracing::debug!(error = %e, "could not disable Nagle on a forwarded connection");
+    }
 }
 
 /// Wraps an `AsyncRead`/`AsyncWrite`, adding each transferred byte to a shared
@@ -203,6 +230,48 @@ mod tests {
         assert_eq!(buf[0], 1);
         assert_eq!(&buf[1..3], &[0x22, 0xb8]); // 8888
         assert_eq!(buf[3], 9); // len("127.0.0.1")
+    }
+
+    #[tokio::test]
+    async fn splice_disables_nagle_on_the_forwarded_socket() {
+        use std::net::Ipv4Addr;
+
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        assert!(
+            !client.nodelay().unwrap(),
+            "precondition: a fresh socket has Nagle enabled — that is what splice must override"
+        );
+
+        // Socket options are shared across dup'd descriptors, so a cloned handle
+        // still observes what splice does to the socket it takes ownership of.
+        let probe = client.into_std().unwrap();
+        let handed_off = TcpStream::from_std(probe.try_clone().unwrap()).unwrap();
+
+        // Close both peers so each direction hits EOF straight away; we only
+        // care about the socket setup splice performs before copying.
+        drop(server);
+        let (near, far) = tokio::io::duplex(64);
+        drop(far);
+        let (recv, send) = tokio::io::split(near);
+        let _ = splice(
+            handed_off,
+            send,
+            recv,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+
+        assert!(
+            probe.nodelay().unwrap(),
+            "splice must disable Nagle on every forwarded socket"
+        );
     }
 
     #[tokio::test]
