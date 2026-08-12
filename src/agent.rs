@@ -429,6 +429,10 @@ async fn handle_tunnel_conn(
     pool: Arc<HelperPool>,
     state_tx: watch::Sender<(usize, bool)>,
 ) {
+    // The agent's end of a tunnel connection carries the same forwarded payload
+    // as the client's end, so it needs Nagle off too.
+    proto::disable_nagle(&tcp);
+
     let mut received = [0u8; 32];
     if tcp.read_exact(&mut received).await.is_err() {
         return;
